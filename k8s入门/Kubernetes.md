@@ -1,4 +1,4 @@
-# 热门百度百科
+# 百度百科
 
 kubernetes，简称K8s，是用8代替8个字符“ubernete”而成的缩写。是一个开源的，用于管理云平台中多个主机上的容器化的应用，Kubernetes的目标是让部署容器化的应用简单并且高效（powerful）,Kubernetes提供了应用部署，规划，更新，维护的一种机制。
 
@@ -1673,7 +1673,7 @@ kubectl --help
 | 基本命令   | create       | 创建                        | 创建一个资源                 |
 |            | edit         | 编辑                        | 编辑一个资源*                |
 |            | get          | 获取                        | 获取一个资源                 |
-|            | patch        | 更新                        | 更新一个资源*                |
+|            | patch        | 更新                        | 更新一个资源，补丁，部分更新 |
 |            | delete       | 删除                        | 删除一个资源                 |
 |            | explain      | 解释                        | 展示资源文档                 |
 | 运行和调试 | run          | 运行                        | 在集群中运行一个指定的镜像   |
@@ -6595,9 +6595,13 @@ tomcat.itheima.com /  tomcat-service:8080(10.244.1.99:8080,10.244.2.117:8080,10.
 
 # 8. 数据存储
 
-在前面已经提到，容器的生命周期可能很短，会被频繁地创建和销毁。那么容器在销毁时，保存在容器中的数据也会被清除。这种结果对用户来说，在某些情况下是不乐意看到的。为了持久化保存容器的数据，kubernetes引入了Volume的概念。
+在前面已经提到，容器的生命周期可能很短，会被频繁地创建和销毁。那么容器在销毁时，保存在容器中的数据也会被清除。这种结果对用户来说，在某些情况下是不乐意看到的。
 
-Volume是Pod中能够被多个容器访问的共享目录，它被定义在Pod上，然后被一个Pod里的多个容器挂载到具体的文件目录下，kubernetes通过Volume实现同一个Pod中不同容器之间的数据共享以及数据的持久化存储。Volume的生命容器不与Pod中单个容器的生命周期相关，当容器终止或者重启时，Volume中的数据也不会丢失。
+**为了持久化保存容器的数据，kubernetes引入了Volume的概念**。
+
+Volume是Pod中能够被多个容器访问的共享目录，它被定义在Pod上，然后被一个Pod里的多个容器挂载到具体的文件目录下，kubernetes通过**Volume实现**同一个Pod中不同容器之间的**数据共享**以及数据的**持久化存储**。
+
+Volume的生命容器不与Pod中单个容器的生命周期相关，当容器终止或者重启时，Volume中的数据也不会丢失。
 
 kubernetes的Volume支持多种类型，比较常见的有下面几个：
 
@@ -6611,7 +6615,11 @@ kubernetes的Volume支持多种类型，比较常见的有下面几个：
 
 EmptyDir是最基础的Volume类型，一个EmptyDir就是Host上的一个空目录。
 
-EmptyDir是在Pod被分配到Node时创建的，它的初始内容为空，并且无须指定宿主机上对应的目录文件，因为kubernetes会自动分配一个目录，当Pod销毁时， EmptyDir中的数据也会被永久删除。 EmptyDir用途如下：
+EmptyDir是在Pod被分配到Node时创建的，它的初始内容为空，并且无须指定宿主机上对应的目录文件，因为kubernetes会自动分配一个目录，当Pod销毁时， EmptyDir中的数据也会被永久删除。 
+
+> 临时目录在`/var/lib/kubelet/pods` 目录下，格式是`/var/lib/kubelet/pods/<pod-uid>/volumes/kubernetes.io~empty-dir/<volume-name>`
+
+EmptyDir用途如下：
 
 - 临时空间，例如用于某些应用程序运行时所需的临时目录，且无须永久保留
 - 一个容器需要从另一个容器中**获取数据**的目录（多容器共享目录）
@@ -6667,7 +6675,12 @@ volume-emptydir       2/2     Running   0          97s   10.42.2.9   node1  ....
 # 通过kubectl logs命令查看pod中指定容器的标准输出
 [root@k8s-master01 ~]# kubectl logs -f volume-emptydir -n dev -c busybox
 10.42.1.0 - - [27/Jun/2021:15:08:54 +0000] "GET / HTTP/1.1" 200 612 "-" "curl/7.29.0" "-"
+## 客户端ip（cni0网卡） code 响应体size 
 ```
+
+host对应的临时目录：
+
+![image-20240126174655088](Kubernetes.assets/image-20240126174655088.png)
 
 ### 8.1.2 HostPath
 
@@ -6675,7 +6688,7 @@ volume-emptydir       2/2     Running   0          97s   10.42.2.9   node1  ....
 
 HostPath就是将Node主机中一个实际目录挂在到Pod中，以供容器使用，这样的设计就可以保证Pod销毁了，但是数据依据可以存在于Node主机上。
 
-![img](Kubernetes.assets/image-20200413214031331.png)
+<img src="Kubernetes.assets/image-20200413214031331.png" alt="img" style="zoom: 80%;" />
 
 创建一个volume-hostpath.yaml：
 
@@ -6707,7 +6720,7 @@ spec:
       type: DirectoryOrCreate  # 目录存在就使用，不存在就先创建后使用
 ```
 
-```
+```bash
 关于type的值的一点说明：
     DirectoryOrCreate 目录存在就使用，不存在就先创建后使用
     Directory   目录必须存在
@@ -6755,6 +6768,7 @@ NFS是一个网络文件存储系统，可以搭建一台NFS服务器，然后�
 
 # 准备一个共享目录
 [root@nfs ~]# mkdir /root/data/nfs -pv
+mkdir: created directory '/root/data/nfs'
 
 # 将共享目录以读写权限暴露给192.168.5.0/24网段中的所有主机
 [root@nfs ~]# vim /etc/exports
@@ -6815,11 +6829,13 @@ NAME                  READY   STATUS    RESTARTS   AGE
 volume-nfs        2/2     Running   0          2m9s
 
 # 查看nfs服务器上的共享目录，发现已经有文件了
-[root@k8s-master01 ~]# ls /root/data/
+[root@k8s-master01 ~]# ls /root/data/nfs
 access.log  error.log
 ```
 
-总结：
+
+
+> 总结
 
 1、其实主要是volums配置的不同，定义了volumn的路径等，然后在pod contain中通过volumeMounts挂载到定义的volumn卷。
 
@@ -6831,7 +6847,7 @@ access.log  error.log
 
 前面已经学习了使用NFS提供存储，此时就要求用户会搭建NFS系统，并且会在yaml配置nfs。
 
-由于kubernetes支持的存储系统有很多，要求客户全都掌握，显然不现实。为了能够屏蔽底层存储实现的细节，方便用户使用， kubernetes引入PV和PVC两种资源对象。
+由于kubernetes支持的存储系统有很多，要求客户全都掌握，显然不现实。为了能够**屏蔽底层存储实现的细节**，方便用户使用， kubernetes引入PV和PVC两种资源对象。
 
 PV（Persistent Volume）是持久化卷的意思，是对底层的共享存储的一种抽象。一般情况下PV由kubernetes管理员进行创建和配置，它与底层具体的共享存储技术有关，并通过插件完成与共享存储的对接。
 
@@ -6856,6 +6872,8 @@ metadata:
   name: pv2
 spec:
   nfs: # 存储类型，与底层真正存储对应
+    path: /root/data/pv1 # 路徑
+    server: 192.168.5.6 # 服務器ip
   capacity:  # 存储能力，目前只支持存储空间的设置
     storage: 2Gi
   accessModes:  # 访问模式
@@ -6873,7 +6891,7 @@ PV 的关键配置参数说明：
 
 目前只支持存储空间的设置( storage=1Gi )，不过未来可能会加入IOPS、吞吐量等指标的配置
 
-- **访问模式（accessModes）**
+- **访问模式（accessModes）**<[]string>
 
   用于描述用户应用对存储资源的访问权限，访问权限包括下面几种方式：
 
@@ -6887,7 +6905,7 @@ PV 的关键配置参数说明：
 
   当PV不再被使用了之后，对其的处理方式。目前支持三种策略：
 
-  - Retain （保留） 保留数据，需要管理员手工清理数据
+  - Retain （保留） 保留数据，需要管理员手工清理数据，默认
   - Recycle（回收） 清除 PV 中的数据，效果相当于执行 rm -rf /thevolume/*
   - Delete （删除） 与 PV 相连的后端存储完成 volume 的删除操作，当然这常见于云服务商的存储服务
 
@@ -6926,7 +6944,7 @@ PV 的关键配置参数说明：
 /root/data/pv3     192.168.5.0/24(rw,no_root_squash)
 
 # 重启服务
-[root@nfs ~]#  systemctl restart nfs
+[root@nfs ~]#  systemctl restart nfs-server
 ```
 
 2) 创建pv.yaml
@@ -6996,7 +7014,9 @@ pv3    3Gi        RWX            Retain        Available    9s    Filesystem
 
 ### 8.2.2 PVC
 
-PVC是资源的申请，用来声明对存储空间、访问模式、存储类别需求信息。下面是资源清单文件:
+PVC是资源的申请，用来声明对存储空间、访问模式、存储类别需求信息。
+
+下面是资源清单文件:
 
 ```yaml
 apiVersion: v1
@@ -7136,7 +7156,7 @@ spec:
     - name: volume
       persistentVolumeClaim:
         claimName: pvc2
-        readOnly: false
+        readOnly: false # 默认false
 ```
 
 ```shell
@@ -7167,11 +7187,11 @@ pv3    3Gi        RWX            Retain           Bound    dev/pvc3    5h11m   F
 
 # 查看nfs中的文件存储
 [root@nfs ~]# more /root/data/pv1/out.txt
-node1
-node1
+pod1
+pod1
 [root@nfs ~]# more /root/data/pv2/out.txt
-node2
-node2
+pod2
+pod2
 ```
 
 ### 8.2.3 生命周期
@@ -7185,9 +7205,9 @@ PVC和PV是一一对应的，PV和PVC之间的相互作用遵循以下生命周�
   在用户定义好PVC之后，系统将根据PVC对存储资源的请求在已存在的PV中选择一个满足条件的
 
   - 一旦找到，就将该PV与用户定义的PVC进行绑定，用户的应用就可以使用这个PVC了
-  - 如果找不到，PVC则会无限期处于Pending状态，直到等到系统管理员创建了一个符合其要求的PV
+  - 如果找不到，PVC则会无限期处于**Pending状态**，直到等到系统管理员创建了一个符合其要求的PV
 
-  PV一旦绑定到某个PVC上，就会被这个PVC独占，不能再与其他PVC进行绑定了
+  PV一旦绑定到某个PVC上，就会被这个**PVC独占**，不能再与其他PVC进行绑定了
 
 - **资源使用**：用户可在pod中像volume一样使用pvc
 
@@ -7195,29 +7215,69 @@ PVC和PV是一一对应的，PV和PVC之间的相互作用遵循以下生命周�
 
 - **资源释放**：用户删除pvc来释放pv
 
-  当存储资源使用完毕后，用户可以删除PVC，与该PVC绑定的PV将会被标记为“已释放”，但还不能立刻与其他PVC进行绑定。通过之前PVC写入的数据可能还被留在存储设备上，只有在清除之后该PV才能再次使用。
+  当存储资源使用完毕后，用户可以删除PVC，与该PVC绑定的PV将会被标记为“已释放”，但还不能立刻与其他PVC进行绑定。
+
+  通过之前PVC写入的数据可能还被留在存储设备上，**只有在清除数据之后该PV才能再次使用**。
 
 - **资源回收**：kubernetes根据pv设置的回收策略进行资源的回收
 
   对于PV，管理员可以设定回收策略，用于设置与之绑定的PVC释放资源之后如何处理遗留数据的问题。只有PV的存储空间完成回收，才能供新的PVC绑定和使用
+  
+  <img src="Kubernetes.assets/image-20240126194652201.png" alt="image-20240126194652201" style="zoom:50%;" />
 
 ![img](Kubernetes.assets/image-20200515002806726.png)
+
+
+
+#### 删除pvc
+
+在 Kubernetes 中，如果一个 PersistentVolumeClaim (PVC) 正在被一个或多个 Pod 使用，那么默认情况下是无法直接删除该 PVC 的。这是因为 PVC 与 Pod 之间存在绑定关系，删除 PVC 可能会导致 Pod 无法访问其所需的持久化存储。
+
+要成功删除一个 PVC，你需要先删除使用该 PVC 的 Pod。
+
+```bash
+# 查看绑定pvc的pod
+[root@k8s-master01 ~]# kubectl describe pvc pvc2 -n dev
+Name:          pvc2
+Namespace:     dev
+StorageClass:  
+Status:        Terminating (lasts 9m10s)
+Volume:        pv2
+Labels:        <none>
+Annotations:   pv.kubernetes.io/bind-completed: yes
+               pv.kubernetes.io/bound-by-controller: yes
+Finalizers:    [kubernetes.io/pvc-protection]
+Capacity:      2Gi
+Access Modes:  RWX
+VolumeMode:    Filesystem
+Used By:       pod2 # 绑定的pod
+Events:        <none>
+
+# 删除pod
+
+# 删除pvc
+
+```
+
+
 
 ### 8.2.4 StorageClass 存储类
 
 https://kubernetes.io/zh-cn/docs/concepts/storage/storage-classes/
 
-目前看来，在pvc中指定StorageClassName,会自动创建对应的pv？
+StorageClass 是用来定义 PVC 的动态存储配置的对象。
 
-对的，管理员可以为没有申请绑定到特定 StorageClass 的 PVC 指定一个默认的存储类。
+当你在 PVC 中指定了 StorageClassName 字段，Kubernetes 会根据该字段查找匹配的 StorageClass，并根据该 StorageClass 的配置自动创建一个符合要求的 PV。如果没有合适的 PV 可用，Kubernetes 会尝试使用该 StorageClass 创建一个新的 PV。这样，你就无需手动创建 PV，而是通过 PVC 的声明来触发 PV 的动态创建。
 
-配置文件：
+#### 配置文件
+
+sc-standard.yaml
 
 ```yaml
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
-  name: standard
+  name: sc-standard
 provisioner: kubernetes.io/aws-ebs
 parameters:
   type: gp2
@@ -7228,11 +7288,46 @@ mountOptions:
 volumeBindingMode: Immediate
 ```
 
+pv示例 my-pvc.yaml：
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-pvc
+spec:
+  storageClassName: sc-standard
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+```
+
+
+
+```sh
+[root@k8s-master01 ~]# kubectl get sc,pvc -n dev
+NAME                                      PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE   ALLOWVOLUMEEXPANSION   AGE
+storageclass.storage.k8s.io/sc-standard   kubernetes.io/aws-ebs   Retain          Immediate           true                   2m50s
+
+NAME                           STATUS    VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+persistentvolumeclaim/my-pvc   Pending                                      sc-standard    <unset>                 59s
+
+# 查看pvc的Pending原因
+[root@k8s-master01 ~]# kubectl describe -n dev  pvc  my-pvc
+xxxxxxx
+Events:
+  Type    Reason                Age                  From                         Message
+  ----    ------                ----                 ----                         -------
+  Normal  ExternalProvisioning  4s (x10 over 2m10s)  persistentvolume-controller  Waiting for a volume to be created either by the external provisioner 'ebs.csi.aws.com' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+```
+
 
 
 #### 存储制备器
 
-每个 StorageClass 都有一个制备器（Provisioner），用来决定使用哪个卷插件制备 PV。 该字段必须指定。
+每个 StorageClass 都有一个制备器（**Provisione**r），用来决定使用哪个卷插件制备 PV。 该字段必须指定。
 
 内部制备器 vs 外部制备器：
 
@@ -7258,6 +7353,22 @@ data:
     password:123456
 ```
 
+| 是多行字符，保留换行符等格式。上面yaml文件对应的json格式：
+
+```json
+{
+  "apiVersion": "v1",
+  "kind": "ConfigMap",
+  "metadata": {
+    "name": "configmap",
+    "namespace": "dev"
+  },
+  "data": {
+    "info": "username:admin\npassword:123456"
+  }
+}
+```
+
 接下来，使用此配置文件创建configmap
 
 ```shell
@@ -7277,7 +7388,7 @@ Data
 info:
 ----
 username:admin
-password:123456
+password:12345678
 
 Events:  <none>
 ```
@@ -7325,6 +7436,7 @@ password:12345678
 # 可以看到映射已经成功，每个configmap都映射成了一个目录
 # key--->文件     value---->文件中的内容
 # 此时如果更新configmap的内容, 容器中的值也会动态更新
+[root@k8s-master01 ~]# kubectl edit cm configmap -n dev
 ```
 
 ![image-20210901200807390](Kubernetes.assets/image-20210901200807390.png)
@@ -7352,11 +7464,17 @@ kind: Secret
 metadata:
   name: secret
   namespace: dev
-type: Opaque
+type: Opaque # 
 data:
   username: YWRtaW4=
   password: MTIzNDU2
 ```
+
+具体配置看：https://kubernetes.io/zh-cn/docs/concepts/configuration/secret/
+
+type类型：
+
+<img src="Kubernetes.assets/image-20240129110550000.png" alt="image-20240129110550000" style="zoom:50%;" />
 
 ```shell
 # 创建secret
@@ -7373,7 +7491,7 @@ Type:  Opaque
 Data
 ====
 password:  6 bytes
-username:  5 bytes
+username:  5 bytes # 5 字符
 ```
 
 3) 创建pod-secret.yaml，将上面创建的secret挂载进去：
@@ -7421,15 +7539,17 @@ admin
 
 # 9. 安全认证
 
+> [官方文档](https://kubernetes.io/zh-cn/docs/reference/access-authn-authz/authentication/)
+
 ## 9.1 访问控制概述
 
-Kubernetes作为一个分布式集群的管理工具，保证集群的安全性是其一个重要的任务。所谓的安全性其实就是保证对Kubernetes的各种**客户端**进行**认证和鉴权**操作。
+Kubernetes作为一个分布式集群的管理工具，保证集群的**安全性**是其一个重要的任务。所谓的安全性其实就是保证对Kubernetes的各种**客户端**进行**认证和鉴权**操作。
 
 **客户端**
 
 在Kubernetes集群中，客户端通常有两类：
 
-- **User Account**：一般是独立于kubernetes之外的其他服务管理的用户账号。
+- **User Account**：一般是独立于kubernetes之外的其他服务~~管理~~的用户账号，如dashbored的账号。
 - **Service Account**：kubernetes管理的账号，用于为Pod中的服务进程在访问Kubernetes时提供身份标识。
 
 ![img](Kubernetes.assets/image-20200520102949189.png)
@@ -7444,27 +7564,39 @@ ApiServer是访问及管理资源对象的唯一入口。任何一个请求访�
 
 ![img](Kubernetes.assets/image-20200520103942580.png)
 
-## 9.2 认证管理
+## 9.2 认证(authentication)管理
 
 Kubernetes集群安全的最关键点在于如何识别并认证客户端身份，它提供了3种客户端身份认证方式：
 
 - HTTP Base认证：通过用户名+密码的方式认证
 
+  ​    这种认证方式是把“用户名:密码”用BASE64算法进行编码后的字符串放在HTTP请求中的Header Authorization域里发送给服务端。
+
+  服务端收到后进行解码，获取用户名及密码，然后进行用户身份认证的过程。
+
+  例子：
+
+  ```http
+  GET /api/resource HTTP/1.1
+  Host: example.com
+  Authorization: Basic dXNlcm5hbWU6cGFzc3dvcmQ=
   ```
-      这种认证方式是把“用户名:密码”用BASE64算法进行编码后的字符串放在HTTP请求中的Header Authorization域里发送给服务端。服务端收到后进行解码，获取用户名及密码，然后进行用户身份认证的过程。
-  ```
+
+  `dXNlcm5hbWU6cGFzc3dvcmQ=` 是将 "用户名:密码"（例如，"username:password"）使用 Base64 编码后的结果
+
+  
 
 - HTTP Token认证：通过一个Token来识别合法用户
 
-  ```
-      这种认证方式是用一个很长的难以被模仿的字符串--Token来表明客户身份的一种方式。每个Token对应一个用户名，当客户端发起API调用请求时，需要在HTTP Header里放入Token，API Server接到Token后会跟服务器中保存的token进行比对，然后进行用户身份认证的过程。
-  ```
+  ​    这种认证方式是用一个很长的难以被模仿的字符串--Token来表明客户身份的一种方式。
 
-- HTTPS证书认证：基于CA根证书签名的双向数字证书认证方式
+  每个Token对应一个用户名，当客户端发起API调用请求时，需要在HTTP Header里放入Token，API Server接到Token后会跟服务器中保存的token进行比对，然后进行用户身份认证的过程。
 
-  ```
-      这种认证方式是安全性最高的一种方式，但是同时也是操作起来最麻烦的一种方式。
-  ```
+  
+
+- HTTPS证书认证：基于CA根证书签名的**双向**数字证书认证方式
+
+  ​    这种认证方式是安全性最高的一种方式，但是同时也是操作起来最麻烦的一种方式。
 
 ![img](Kubernetes.assets/image-20200518211037434.png)
 
@@ -7483,7 +7615,7 @@ Kubernetes集群安全的最关键点在于如何识别并认证客户端身份�
    ```
      1> 客户端向服务器端发起请求，服务端下发自己的证书给客户端，
         客户端接收到证书后，通过私钥解密证书，在证书中获得服务端的公钥，
-        客户端利用服务器端的公钥认证证书中的信息，如果一致，则认可这个服务器
+        客户端利用服务器端的公钥认证证书中的信息，如果一致，则认可这个服务器 （非对称加密）
      2> 客户端发送自己的证书给服务器端，服务端接收到证书后，通过私钥解密证书，
         在证书中获得客户端的公钥，并用该公钥认证证书信息，确认客户端是否合法
    ```
@@ -7507,32 +7639,32 @@ Kubernetes集群安全的最关键点在于如何识别并认证客户端身份�
 
    ```
      服务器端和客户端协商好加密方案后，客户端会产生一个随机的秘钥并加密，然后发送到服务器端。
-     服务器端接收这个秘钥后，双方接下来通信的所有内容都通过该随机秘钥加密
+     服务器端接收这个秘钥后，双方接下来通信的所有内容都通过该随机秘钥加密（对称加密）
    ```
 
 > 注意: Kubernetes允许同时配置多种认证方式，只要其中任意一个方式认证通过即可
 
-## 9.3 授权管理
+## 9.3 授权(authorization)管理
 
 授权发生在认证成功之后，通过认证就可以知道请求用户是谁， 然后Kubernetes会根据事先定义的授权策略来决定用户是否有权限访问，这个过程就称为授权。
 
-每个发送到ApiServer的请求都带上了用户和资源的信息：比如发送请求的用户、请求的路径、请求的动作等，授权就是根据这些信息和授权策略进行比较，如果符合策略，则认为授权通过，否则会返回错误。
+每个发送到ApiServer的请求都带上了用户和资源的信息：比如发送请求的用户、请求的路径、请求的动作等，授权就是根据这些信息和**授权策略**进行比较，如果符合策略，则认为授权通过，否则会返回错误。
 
 API Server目前支持以下几种授权策略：
 
 - AlwaysDeny：表示拒绝所有请求，一般用于测试
 - AlwaysAllow：允许接收所有请求，相当于集群不需要授权流程（Kubernetes默认的策略）
-- ABAC：基于属性的访问控制，表示使用用户配置的授权规则对用户请求进行匹配和控制
+- ABAC：基于属性的访问控制（attribute based access control)，表示使用用户配置的授权规则对用户请求进行匹配和控制
 - Webhook：通过调用外部REST服务对用户进行授权
 - Node：是一种专用模式，用于对kubelet发出的请求进行访问控制
-- RBAC：基于角色的访问控制（kubeadm安装方式下的默认选项）
+- RBAC：基于角色的访问控制（role），kubeadm安装方式下的默认选项。
 
 RBAC(Role-Based Access Control) 基于角色的访问控制，主要是在描述一件事情：**给哪些对象授予了哪些权限**
 
 其中涉及到了下面几个概念：
 
 - 对象：User、Groups、ServiceAccount
-- 角色：代表着一组定义在资源上的可操作动作(权限)的集合
+- 角色：代表着一组定义在资源上的**可操作动作(权限)的集合**
 - 绑定：将定义好的角色跟用户绑定在一起
 
 ![img](Kubernetes.assets/image-20200519181209566.png)
@@ -7542,14 +7674,14 @@ RBAC引入了4个顶级资源对象：
 - Role、ClusterRole：角色，用于指定一组权限
 - RoleBinding、ClusterRoleBinding：角色绑定，用于将角色（权限）赋予给对象
 
-**Role、ClusterRole**
+### **Role、ClusterRole**
 
-一个角色就是一组权限的集合，这里的权限都是许可形式的（白名单）。
+一个角色就是一组权限的集合，这里的权限都是许可形式的（白名单）。role是命名空间隔离的。
 
 ```yaml
 # Role只能对命名空间内的资源进行授权，需要指定nameapce
 kind: Role
-apiVersion: rbac.authorization.k8s.io/v1beta1
+apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   namespace: dev
   name: authorization-role
@@ -7559,10 +7691,13 @@ rules:
   verbs: ["get", "watch", "list"] # 允许的对资源对象的操作方法列表
 ```
 
+
+
 ```yaml
 # ClusterRole可以对集群范围内资源、跨namespaces的范围资源、非资源类型进行授权
+
 kind: ClusterRole
-apiVersion: rbac.authorization.k8s.io/v1beta1
+apiVersion: rbac.authorization.k8s.io/v1
 metadata:
  name: authorization-clusterrole
 rules:
@@ -7573,7 +7708,7 @@ rules:
 
 需要详细说明的是，rules中的参数：
 
-- apiGroups: 支持的API组列表
+- apiGroups: 支持的**API组**列表，看apiVersion的前缀表示对应的api组
 
   ```
   "","apps", "autoscaling", "batch"
@@ -7593,14 +7728,14 @@ rules:
   "get", "list", "watch", "create", "update", "patch", "delete", "exec"
   ```
 
-**RoleBinding、ClusterRoleBinding**
+### **RoleBinding、ClusterRoleBinding**
 
 角色绑定用来把一个角色绑定到一个目标对象上，绑定目标可以是User、Group或者ServiceAccount。
 
 ```yaml
 # RoleBinding可以将同一namespace中的subject绑定到某个Role下，则此subject即具有该Role定义的权限
 kind: RoleBinding
-apiVersion: rbac.authorization.k8s.io/v1beta1
+apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: authorization-role-binding
   namespace: dev
@@ -7617,7 +7752,7 @@ roleRef:
 ```yaml
 # ClusterRoleBinding在整个集群级别和所有namespaces将特定的subject与ClusterRole绑定，授予权限
 kind: ClusterRoleBinding
-apiVersion: rbac.authorization.k8s.io/v1beta1
+apiVersion: rbac.authorization.k8s.io/v1
 metadata:
  name: authorization-clusterrole-binding
 subjects:
@@ -7630,7 +7765,7 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 ```
 
-**RoleBinding引用ClusterRole进行授权**
+### **RoleBinding可以引用ClusterRole进行授权**
 
 RoleBinding可以引用ClusterRole，对属于同一命名空间内ClusterRole定义的资源主体进行授权。
 
@@ -7642,7 +7777,7 @@ RoleBinding可以引用ClusterRole，对属于同一命名空间内ClusterRole�
 # 虽然authorization-clusterrole是一个集群角色，但是因为使用了RoleBinding
 # 所以heima只能读取dev命名空间中的资源
 kind: RoleBinding
-apiVersion: rbac.authorization.k8s.io/v1beta1
+apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: authorization-role-binding-ns
   namespace: dev
@@ -7656,27 +7791,49 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 ```
 
-**实战：创建一个只能管理dev空间下Pods资源的账号**
+### **实战**
 
-1) 创建账号
+**创建一个只能管理dev空间下Pods资源的账号**
+
+#### 1、创建账号
 
 ```shell
-# 1) 创建证书(生成私钥)
+# 1) 创建证书(生成私钥) devman.key
 [root@k8s-master01 pki]# cd /etc/kubernetes/pki/
 [root@k8s-master01 pki]# (umask 077;openssl genrsa -out devman.key 2048)
+Generating RSA private key, 2048 bit long modulus (2 primes)
+...........+++++
+.............................+++++
+e is 65537 (0x010001)
 
 # 2) 用apiserver的证书去签署
 # 2-1) 签名申请，申请的用户是devman,组是devgroup,证书签名请求（CSR）
+      # -subj "/CN=devman/O=devgroup"：指定证书主题（Subject），包括 Common Name (CN) 和 Organization (O) 等信息。
 [root@k8s-master01 pki]# openssl req -new -key devman.key -out devman.csr -subj "/CN=devman/O=devgroup"     
 # 2-2) 签署证书
 [root@k8s-master01 pki]# openssl x509 -req -in devman.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out devman.crt -days 3650
+Signature ok
+subject=CN = devman, O = devgroup
+Getting CA Private Key
 
 # 3) 设置集群、用户、上下文信息
 [root@k8s-master01 pki]# kubectl config set-cluster kubernetes --embed-certs=true --certificate-authority=/etc/kubernetes/pki/ca.crt --server=https://192.168.109.100:6443
+Cluster "kubernetes" set.
 
+# 设置用户信息，就是这一步创建的user，需要指定客户端私钥ley和证书crt
 [root@k8s-master01 pki]# kubectl config set-credentials devman --embed-certs=true --client-certificate=/etc/kubernetes/pki/devman.crt --client-key=/etc/kubernetes/pki/devman.key
-
+User "devman" set.
+# 查看创建的user
+[root@k8s-master01 pki]# kubectl config view
+xxxxx
+users:
+- name: devman
+  user:
+    client-certificate-data: DATA+OMITTED
+    client-key-data: DATA+OMITTED
+# 设置context
 [root@k8s-master01 pki]# kubectl config set-context devman@kubernetes --cluster=kubernetes --user=devman
+Context "devman@kubernetes" created.
 
 # 切换账户到devman
 [root@k8s-master01 pki]# kubectl config use-context devman@kubernetes
@@ -7693,19 +7850,21 @@ Switched to context "kubernetes-admin@kubernetes".
 
 ![image-20210907112312162](Kubernetes.assets/image-20210907112312162.png)
 
-![image-20210907113107985](Kubernetes.assets/image-20210907113107985.png)
-
 ![image-20210907113233245](Kubernetes.assets/image-20210907113233245.png)
 
 ![image-20210907113439945](Kubernetes.assets/image-20210907113439945.png)
 
 
 
-2） 创建Role和RoleBinding，为devman用户授权
+####  2、创建Role和RoleBinding
+
+RoleBinding为devman用户授权
+
+dev-role.yaml：
 
 ```yaml
 kind: Role
-apiVersion: rbac.authorization.k8s.io/v1beta1
+apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   namespace: dev
   name: dev-role
@@ -7717,7 +7876,7 @@ rules:
 ---
 
 kind: RoleBinding
-apiVersion: rbac.authorization.k8s.io/v1beta1
+apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: authorization-role-binding
   namespace: dev
@@ -7735,9 +7894,17 @@ roleRef:
 [root@k8s-master01 pki]# kubectl create -f dev-role.yaml
 role.rbac.authorization.k8s.io/dev-role created
 rolebinding.rbac.authorization.k8s.io/authorization-role-binding created
+
+[root@k8s-master01 pki]# kubectl get role,rolebindings -n dev -o wide 
+NAME                                      CREATED AT
+role.rbac.authorization.k8s.io/dev-role   2024-01-30T06:37:46Z
+
+NAME                                                               ROLE            AGE   USERS    GROUPS   SERVICEACCOUNTS
+rolebinding.rbac.authorization.k8s.io/authorization-role-binding   Role/dev-role   15m   devman
+
 ```
 
-3) 切换账户，再次验证
+#### 3、切换账户，再次验证
 
 ```shell
 # 切换账户到devman
@@ -7756,16 +7923,18 @@ nginx-deployment-66cb59b984-thfck    1/1     Running            0          4d1h
 Switched to context "kubernetes-admin@kubernetes".
 ```
 
-## 9.4 准入控制
+## 9.4 准入(admission)控制
 
 通过了前面的认证和授权之后，还需要经过准入控制处理通过之后，apiserver才会处理这个请求。
 
-准入控制是一个可配置的控制器列表，可以通过在Api-Server上通过命令行设置选择执行哪些准入控制器：
+准入控制是一个可配置的控制器列表，可以通过在启动Api-Server时通过命令行设置选择执行哪些准入控制器：
 
 ```
 --admission-control=NamespaceLifecycle,LimitRanger,ServiceAccount,PersistentVolumeLabel,
                       DefaultStorageClass,ResourceQuota,DefaultTolerationSeconds
 ```
+
+已启动的apiserver可以修改`/etc/kubernetes/manifests/kube-apiserver.yaml`.
 
 只有当所有的准入控制器都检查通过之后，apiserver才执行该请求，否则返回拒绝。
 
@@ -7790,7 +7959,9 @@ Switched to context "kubernetes-admin@kubernetes".
 
 # 10. DashBoard
 
-之前在kubernetes中完成的所有操作都是通过命令行工具kubectl完成的。其实，为了提供更丰富的用户体验，kubernetes还开发了一个基于web的用户界面（Dashboard）。用户可以使用Dashboard部署容器化的应用，还可以监控应用的状态，执行故障排查以及管理kubernetes中各种资源。
+之前在kubernetes中完成的所有操作都是通过命令行工具kubectl完成的。
+
+其实，为了提供更丰富的用户体验，kubernetes还开发了一个基于web的用户界面（Dashboard）。用户可以使用Dashboard部署容器化的应用，还可以监控应用的状态，执行故障排查以及管理kubernetes中各种资源。
 
 ## 10.1 部署Dashboard
 
@@ -7799,6 +7970,8 @@ Switched to context "kubernetes-admin@kubernetes".
 ```shell
 # 下载yaml
 [root@k8s-master01 ~]# wget  https://raw.githubusercontent.com/kubernetes/dashboard/v2.0.0/aio/deploy/recommended.yaml
+
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v2.7.0/aio/deploy/recommended.yaml
 
 # 修改kubernetes-dashboard的Service类型
 kind: Service
@@ -7819,6 +7992,22 @@ spec:
 
 # 部署
 [root@k8s-master01 ~]# kubectl create -f recommended.yaml
+namespace/kubernetes-dashboard created
+serviceaccount/kubernetes-dashboard created
+service/kubernetes-dashboard created
+secret/kubernetes-dashboard-certs created
+secret/kubernetes-dashboard-csrf created
+secret/kubernetes-dashboard-key-holder created
+configmap/kubernetes-dashboard-settings created
+role.rbac.authorization.k8s.io/kubernetes-dashboard created
+clusterrole.rbac.authorization.k8s.io/kubernetes-dashboard created
+rolebinding.rbac.authorization.k8s.io/kubernetes-dashboard created
+clusterrolebinding.rbac.authorization.k8s.io/kubernetes-dashboard created
+deployment.apps/kubernetes-dashboard created
+service/dashboard-metrics-scraper created
+Warning: spec.template.metadata.annotations[seccomp.security.alpha.kubernetes.io/pod]: non-functional in v1.27+; use the "seccompProfile" field instead
+deployment.apps/dashboard-metrics-scraper created
+
 
 # 查看namespace下的kubernetes-dashboard下的资源
 [root@k8s-master01 ~]# kubectl get pod,svc -n kubernetes-dashboard
@@ -7833,16 +8022,53 @@ service/kubernetes-dashboard       NodePort   10.104.178.171  <none>       443:3
 
 2）创建访问账户，获取token
 
-```shell
+> 详见[dashboard](https://github.com/kubernetes/dashboard/blob/master/docs/user/access-control/creating-sample-user.md)
+
+```yaml
 # 创建账号
 [root@k8s-master01-1 ~]# kubectl create serviceaccount dashboard-admin -n kubernetes-dashboard
+serviceaccount/dashboard-admin created
 
 # 授权
 [root@k8s-master01-1 ~]# kubectl create clusterrolebinding dashboard-admin-rb --clusterrole=cluster-admin --serviceaccount=kubernetes-dashboard:dashboard-admin
+```
+
+
+
+获取token：
+
+- 临时
+
+```yaml
+# 临时获取一个token
+# kubectl -n kubernetes-dashboard create token dashboard-admin
+eyJhbGciOiJSUxxxxxxxxxxxxxxxxx
+```
+
+- secret永久
+
+dashboard-admin-token.yaml文件：
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dashboard-admin-token
+  namespace: kubernetes-dashboard
+  annotations:
+    kubernetes.io/service-account.name: "dashboard-admin"   
+type: kubernetes.io/service-account-token 
+```
+
+
+
+```bash
+[root@k8s-master01 ~]# kubectl create -f dashboard-admin-token.yaml 
+secret/dashboard-admin-token created
 
 # 获取账号token
 [root@k8s-master01 ~]#  kubectl get secrets -n kubernetes-dashboard | grep dashboard-admin
-dashboard-admin-token-xbqhh        kubernetes.io/service-account-token   3      2m35s
+dashboard-admin-token        kubernetes.io/service-account-token   3      2m35s
 
 [root@k8s-master01 ~]# kubectl describe secrets dashboard-admin-token-xbqhh -n kubernetes-dashboard
 Name:         dashboard-admin-token-xbqhh
@@ -7855,10 +8081,13 @@ Type:  kubernetes.io/service-account-token
 
 Data
 ====
+
 namespace:  20 bytes
 token:      eyJhbGciOiJSUzI1NiIsImtpZCI6ImJrYkF4bW5XcDhWcmNGUGJtek5NODFuSXl1aWptMmU2M3o4LTY5a2FKS2cifQ.eyJpc3MiOiJrdWJlcm5ldGVzL3NlcnZpY2VhY2NvdW50Iiwia3ViZXJuZXRlcy5pby9zZXJ2aWNlYWNjb3VudC9uYW1lc3BhY2UiOiJrdWJlcm5ldGVzLWRhc2hib2FyZCIsImt1YmVybmV0ZXMuaW8vc2VydmljZWFjY291bnQvc2VjcmV0Lm5hbWUiOiJkYXNoYm9hcmQtYWRtaW4tdG9rZW4teGJxaGgiLCJrdWJlcm5ldGVzLmlvL3NlcnZpY2VhY2NvdW50L3NlcnZpY2UtYWNjb3VudC5uYW1lIjoiZGFzaGJvYXJkLWFkbWluIiwia3ViZXJuZXRlcy5pby9zZXJ2aWNlYWNjb3VudC9zZXJ2aWNlLWFjY291bnQudWlkIjoiOTVkODRkODAtYmU3YS00ZDEwLWEyZTAtNjhmOTAyMjJkMDM5Iiwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50Omt1YmVybmV0ZXMtZGFzaGJvYXJkOmRhc2hib2FyZC1hZG1pbiJ9.NAl7e8ZfWWdDoPxkqzJzTB46sK9E8iuJYnUI9vnBaY3Jts7T1g1msjsBnbxzQSYgAG--cV0WYxjndzJY_UWCwaGPrQrt_GunxmOK9AUnzURqm55GR2RXIZtjsWVP2EBatsDgHRmuUbQvTFOvdJB4x3nXcYLN2opAaMqg3rnU2rr-A8zCrIuX_eca12wIp_QiuP3SF-tzpdLpsyRfegTJZl6YnSGyaVkC9id-cxZRb307qdCfXPfCHR_2rt5FVfxARgg_C0e3eFHaaYQO7CitxsnIoIXpOFNAR8aUrmopJyODQIPqBWUehb7FhlU1DCduHnIIXVC_UICZ-MKYewBDLw
 ca.crt:     1025 bytes
 ```
+
+
 
 3）通过浏览器访问Dashboard的UI
 
@@ -7872,7 +8101,7 @@ ca.crt:     1025 bytes
 
 ## 10.2 使用DashBoard
 
-本章节以Deployment为例演示DashBoard的使用
+本章节以**Deployment**为例演示DashBoard的使用
 
 **查看**
 
