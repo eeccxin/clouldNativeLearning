@@ -961,15 +961,21 @@ EOF
 # 必须指定--setopt=obsoletes=0，否则yum会自动安装更高版本
 [root@master ~]# yum install --setopt=obsoletes=0 docker-ce-18.06.3.ce-3.el7 -y
 
-# 4 添加一个配置文件
+# 4 添加一个配置文件，最新镜像源见：https://gist.github.com/y0ngb1n/7e8f16af3242c7815e7ca2f0833d3ea6
 # Docker在默认情况下使用的Cgroup Driver为cgroupfs，而kubernetes推荐使用systemd来代替cgroupfs
-[root@master ~]# mkdir /etc/docker
-[root@master ~]# cat <<EOF >  /etc/docker/daemon.json
+[root@master ~]# mkdir -p /etc/docker
+[root@master ~]# tee /etc/docker/daemon.json <<-'EOF'
 {
-  "exec-opts": ["native.cgroupdriver=systemd"],
-  "registry-mirrors": ["https://kn0t2bca.mirror.aliyuncs.com"]
+    "registry-mirrors": [
+        "https://dockerproxy.com",
+        "https://docker.mirrors.ustc.edu.cn",
+        "https://docker.nju.edu.cn"
+    ]
 }
 EOF
+# 要先reload才会生效
+[root@master ~]# systemctl daemon-reload  
+[root@master ~]# systemctl restart docker
 
 # 5 启动docker
 [root@master ~]# systemctl restart docker
