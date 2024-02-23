@@ -1066,6 +1066,1228 @@ Rook 项目是一个基于 Ceph 的 Kubernetes 存储插件（它后期也在加
 
 > Pod和pod控制器
 
+## 13 为什么我们需要Pod？
+
+Pod是 Kubernetes 项目中最小的 API 对象。如果换一个更专业的说法，我们可以这样描述：Pod，是 Kubernetes 项目的原子调度单位。
+
+> 为何需要pod
+
+1、“组”的概念，解决**成组调度（gang scheduling）**问题：Pod 是 Kubernetes 里的原子调度单位。这就意味着，Kubernetes 项目的调度器，是统一按照 Pod 而非容器的资源需求进行计算的。
+
+2、Pod，其实是一组共享了某些资源的容器。具体的说：**Pod 里的所有容器，共享的是同一个 Network Namespace，并且可以声明共享同一个 Volume。**
+
+​		在 Kubernetes 项目里，Pod 的实现需要使用一个中间容器，这个容器叫作 Infra 容器。在这个 Pod 中，Infra 容器永远都是第一个被创建的容器，而其他用户定义的容器，则通过 Join Network Namespace 的方式，与 Infra 容器关联在一起:
+
+<img src="深入剖析Kubernetes.assets/8c016391b4b17923f38547c498e434cf.png" alt="img" style="zoom: 67%;" />
+
+​		在 Kubernetes 项目里，Infra 容器一定要占用极少的资源，所以它使用的是一个非常特殊的镜像，叫作：`k8s.gcr.io/pause`。这个镜像是一个用汇编语言编写的、永远处于“暂停”状态的容器，解压后的大小也只有 100~200 KB 左右。
+
+​		对于 Pod 里的容器 A 和容器 B 来说：
+
+- 它们可以直接使用 localhost 进行通信；
+- 它们看到的网络设备跟 Infra 容器看到的完全一样；
+- 一个 Pod 只有一个 IP 地址，也就是这个 Pod 的 Network Namespace 对应的 IP 地址；
+- 当然，其他的所有网络资源，都是一个 Pod 一份，并且被该 Pod 中的所有容器共享；
+- Pod 的生命周期只跟 Infra 容器一致，而与容器 A 和 B 无关。
+
+
+
+### pod编排例子
+
+通过pod实现“超亲密关系”容器的设计思想，实际上就是希望，当用户想在一个容器里跑多个功能并不相关的应用时，应该优先考虑它们是不是更应该被描述成一个 Pod 里的多个容器。
+
+**第一个最典型的例子是：WAR 包与 Web 服务器。**
+
+我们现在有一个 Java Web 应用的 WAR 包，它需要被放在 Tomcat 的 webapps 目录下运行起来。
+
+假如，你现在只能用 Docker 来做这件事情，那该如何处理这个组合关系呢？
+
+- 一种方法是，把 WAR 包直接放在 Tomcat 镜像的 webapps 目录下，做成一个新的镜像运行起来。可是，这时候，如果你要更新 WAR 包的内容，或者要升级 Tomcat 镜像，就要重新制作一个新的发布镜像，非常麻烦。
+- 另一种方法是，你压根儿不管 WAR 包，永远只发布一个 Tomcat 容器。不过，这个容器的 webapps 目录，就必须声明一个 hostPath 类型的 Volume，从而把宿主机上的 WAR 包挂载进 Tomcat 容器当中运行起来。不过，这样你就必须要解决一个问题，即：如何让每一台宿主机，都预先准备好这个存储有 WAR 包的目录呢？这样来看，你只能独立维护一套分布式存储系统了。
+
+实际上，有了 Pod 之后，这样的问题就很容易解决了。我们可以把 WAR 包和 Tomcat 分别做成镜像，然后把它们作为一个 Pod 里的两个容器“组合”在一起。这个 Pod 的配置文件如下所示：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: javaweb-2
+spec:
+  initContainers:
+  - image: geektime/sample:v2
+    name: war
+    command: ["cp", "/sample.war", "/app"]
+    volumeMounts:
+    - mountPath: /app
+      name: app-volume
+  containers:
+  - image: geektime/tomcat:7.0
+    name: tomcat
+    command: ["sh","-c","/root/apache-tomcat-7.0.42-v2/bin/start.sh"]
+    volumeMounts:
+    - mountPath: /root/apache-tomcat-7.0.42-v2/webapps
+      name: app-volume
+    ports:
+    - containerPort: 8080
+      hostPort: 8001 
+  volumes:
+  - name: app-volume
+    emptyDir: {}
+
+```
+
+​		像这样，我们就用一种“组合”方式，解决了 WAR 包与 Tomcat 容器之间耦合关系的问题。这个所谓的“组合”操作，正是容器设计模式里最常用的一种模式，它的名字叫：**sidecar**。
+
+​		顾名思义，sidecar 指的就是我们可以在一个 Pod 中，启动一个辅助容器，来完成一些独立于主进程（主容器）之外的工作。
+
+​		比如，在我们的这个应用 Pod 中，Tomcat 容器是我们要使用的主容器，而 WAR 包容器的存在，只是为了给它提供一个 WAR 包而已。所以，我们**用 Init Container 的方式优先运行 WAR 包容器，扮演了一个 sidecar 的角色**。
+
+
+
+> initContainer容器
+
+在 Pod 中，所有 Init Container 定义的容器，都会比 spec.containers 定义的用户容器先启动。并且，Init Container 容器会按顺序逐一启动，而直到它们都启动并且退出了，用户容器才会启动。
+
+
+
+**第二个例子，则是容器的日志收集。**
+
+比如，我现在有一个应用，需要不断地把日志文件输出到容器的 /var/log 目录中。
+
+这时，我就可以把一个 Pod 里的 Volume 挂载到应用容器的 /var/log 目录上。
+
+然后，我在这个 Pod 里同时运行一个 sidecar 容器，它也声明挂载同一个 Volume 到自己的 /var/log 目录上。
+
+这样，接下来 sidecar 容器就只需要做一件事儿，那就是不断地从自己的 /var/log 目录里读取日志文件，转发到 MongoDB 或者 Elasticsearch 中存储起来。这样，一个最基本的日志收集工作就完成了。
+
+跟第一个例子一样，这个例子中的 sidecar 的主要工作也是使用共享的 Volume 来完成对文件的操作。
+
+
+
+**第三个例子：istio微服务治理**
+
+Pod 的另一个重要特性是，它的所有容器都共享同一个 Network Namespace。这就使得很多与 Pod 网络相关的配置和管理，也都可以交给 sidecar 完成，而完全无须干涉用户容器。这里最典型的例子莫过于 Istio 这个微服务治理项目了。
+
+
+
+### 总结
+
+一个运行在虚拟机里的应用，哪怕再简单，也是被管理在 systemd 或者 supervisord 之下的**一组进程，而不是一个进程**。这跟本地物理机上应用的运行方式其实是一样的。这也是为什么，从物理机到虚拟机之间的应用迁移，往往并不困难。
+
+可是对于容器来说，一个容器永远只能管理一个进程。更确切地说，一个容器，就是一个进程。
+
+你现在可以这么理解 Pod 的本质：
+
+> Pod，实际上是在扮演传统基础设施里“虚拟机”的角色；而容器，则是这个虚拟机里运行的用户程序。
+
+
+
+## 14 深入解析Pod对象（一）：基本概念
+
+一个很自然的问题就是：到底哪些属性属于 Pod 对象，而又有哪些属性属于 Container 呢？
+
+**凡是调度、网络、存储，以及安全相关的属性，基本上是 Pod 级别的。**
+
+### 一些属性
+
+> 跟“机器”相关的配置
+
+**NodeSelector：是一个供用户将 Pod 与 Node 进行绑定的字段**
+
+```
+apiVersion: v1
+kind: Pod
+...
+spec:
+ nodeSelector:
+   disktype: ssd
+```
+
+这样的一个配置，意味着这个 Pod 永远只能运行在携带了“disktype: ssd”标签（Label）的节点上；否则，它将调度失败。
+
+
+
+**NodeName**：一旦 Pod 的这个字段被赋值，Kubernetes 项目就会被认为这个 Pod 已经经过了调度，调度的结果就是赋值的节点名字。所以，这个字段一般由调度器负责设置，但用户也可以设置它来“骗过”调度器，当然这个做法一般是在测试或者调试的时候才会用到。
+
+
+
+**HostAliases：定义了 Pod 的 hosts 文件（比如 /etc/hosts）里的内容**，用法如下：
+
+```yaml
+apiVersion: v1
+kind: Pod
+...
+spec:
+  hostAliases:
+  - ip: "10.1.2.3"
+    hostnames:
+    - "foo.remote"
+    - "bar.remote"
+...
+```
+
+在这个 Pod 的 YAML 文件中，我设置了一组 IP 和 hostname 的数据。这样，这个 Pod 启动后，/etc/hosts 文件的内容将如下所示（追加的方式）：
+
+```
+cat /etc/hosts
+# Kubernetes-managed hosts file.
+127.0.0.1 localhost
+...
+10.244.0.164    pod-base
+
+# Entries added by HostAliases.
+10.1.2.3        foo.remote      bar.remote
+
+```
+
+
+
+> **跟容器的 Linux Namespace 相关的属性**
+
+shareProcessNamespace=true： 设置Pod 里的容器要共享 PID Namespace
+
+例子：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx
+spec:
+  shareProcessNamespace: true
+  containers:
+  - name: nginx
+    image: nginx
+  - name: shell
+    image: busybox
+    stdin: true
+    tty: true
+
+```
+
+
+
+```bash
+$ kubectl create -f nginx.yaml
+$ kubectl attach -it nginx -c shell
+/ # ps ax
+PID   USER     TIME  COMMAND
+    1 root      0:00 /pause
+    8 root      0:00 nginx: master process nginx -g daemon off;
+   14 101       0:00 nginx: worker process
+   15 root      0:00 sh
+   21 root      0:00 ps ax
+```
+
+可以看到，在这个容器里，我们不仅可以看到它本身的 ps ax 指令，还可以看到 nginx 容器的进程，以及 Infra 容器的 /pause 进程。这就意味着，整个 Pod 里的每个容器的进程，对于所有容器来说都是可见的：它们共享了同一个 PID Namespace。
+
+
+
+**凡是 Pod 中的容器要共享宿主机的 Namespace，也一定是 Pod 级别的定义**，比如：
+
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx
+spec:
+  hostNetwork: true
+  hostIPC: true
+  hostPID: true
+  containers:
+  - name: nginx
+    image: nginx
+  - name: shell
+    image: busybox
+    stdin: true
+    tty: true
+
+```
+
+在这个 Pod 中，我定义了共享宿主机的 Network、IPC（Inter-Process Communication，进程间通信） 和 PID Namespace。这就意味着，这个 Pod 里的所有容器，会直接使用宿主机的网络、直接与宿主机进行 IPC 通信、看到宿主机里正在运行的所有进程。
+
+
+
+> Containers属性
+
+Image（镜像）、Command（启动命令）、workingDir（容器的工作目录）、Ports（容器要开发的端口），以及 volumeMounts（容器要挂载的 Volume）都是构成 Kubernetes 项目中 Container 的主要字段。
+
+
+
+ **ImagePullPolicy 字段**定义了镜像拉取的策略（Always，Never ，IfNotPresent）
+
+
+
+**Lifecycle 字段**。它定义的是 Container Lifecycle Hooks。顾名思义，它是在容器状态发生变化时触发一系列“钩子”。
+
+例子：
+
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lifecycle-demo
+spec:
+  containers:
+  - name: lifecycle-demo-container
+    image: nginx
+    lifecycle:
+      postStart:
+        exec:
+          command: ["/bin/sh", "-c", "echo Hello from the postStart handler > /usr/share/message"]
+      preStop:
+        exec:
+          command: ["/usr/sbin/nginx","-s","quit"]
+
+```
+
+
+
+> **Pod 对象在 Kubernetes 中的生命周期**
+
+Pod 生命周期的变化，主要体现在 Pod API 对象的 **Status 部分**，这是它除了 Metadata 和 Spec 之外的第三个重要字段。
+
+其中，pod.status.phase，就是 Pod 的当前状态，它有如下几种可能的情况：
+
+1. Pending。这个状态意味着，Pod 的 YAML 文件已经提交给了 Kubernetes，API 对象已经被创建并保存在 Etcd 当中。但是，这个 Pod 里有些容器因为某种原因而不能被顺利创建。比如，调度不成功。
+2. Running。这个状态下，Pod 已经调度成功，跟一个具体的节点绑定。它包含的容器都已经创建成功，并且至少有一个正在运行中。
+3. Succeeded。这个状态意味着，Pod 里的所有容器都正常运行完毕，并且已经退出了。这种情况在运行一次性任务时最为常见。
+4. Failed。这个状态下，Pod 里至少有一个容器以不正常的状态（非 0 的返回码）退出。这个状态的出现，意味着你得想办法 Debug 这个容器的应用，比如查看 Pod 的 Events 和日志。
+5. Unknown。这是一个异常状态，意味着 Pod 的状态不能持续地被 kubelet 汇报给 kube-apiserver，这很有可能是主从节点（Master 和 Kubelet）间的通信出现了问题。
+
+更进一步地，Pod 对象的 Status 字段，还可以再细分出一组 Conditions。这些细分状态的值包括：PodScheduled、Ready（准备好对外提供服务了）、Initialized，以及 Unschedulable。它们主要用于描述造成当前 Status 的具体原因是什么。
+
+
+
+### 总结
+
+在今天这篇文章中，我详细讲解了 Pod API 对象，介绍了 Pod 的核心使用方法，并分析了 Pod 和 Container 在字段上的异同。希望这些讲解能够帮你更好地理解和记忆 Pod YAML 中的核心字段，以及这些字段的准确含义。
+
+在学习完这篇文章后，我希望你能仔细阅读 $GOPATH/src/k8s.io/kubernetes/vendor/k8s.io/api/core/v1/types.go 里，
+
+type Pod struct ，尤其是 PodSpec 部分的内容。
+
+争取做到下次看到一个 Pod 的 YAML 文件时，不再需要查阅文档，就能做到把常用字段及其作用信手拈来。
+
+```go
+// Pod is a collection of containers that can run on a host. This resource is created
+// by clients and scheduled onto hosts.
+type Pod struct {
+	metav1.TypeMeta `json:",inline"`
+	// Standard object's metadata.
+	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
+	// +optional
+	metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
+
+	// Specification of the desired behavior of the pod.
+	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
+	// +optional
+	Spec PodSpec `json:"spec,omitempty" protobuf:"bytes,2,opt,name=spec"`
+
+	// Most recently observed status of the pod.
+	// This data may not be up to date.
+	// Populated by the system.
+	// Read-only.
+	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
+	// +optional
+	Status PodStatus `json:"status,omitempty" protobuf:"bytes,3,opt,name=status"`
+}
+```
+
+
+
+## 15 深入解析Pod对象（二）：使用进阶
+
+### Projected Volume
+
+Projected Volume “投射数据卷”，作用是为容器提供预先定义好的数据。
+
+1. Secret；
+2. ConfigMap；
+3. Downward API；
+4. ServiceAccountToken（特殊的secret，用来保存服务账号的token）
+
+
+
+> secret
+
+命令行方式：
+
+```
+$ cat ./username.txt
+admin
+$ cat ./password.txt
+c1oudc0w!
+
+$ kubectl create secret generic user --from-file=./username.txt
+$ kubectl create secret generic pass --from-file=./password.txt
+
+```
+
+yaml方式：
+
+```
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysecret
+type: Opaque
+data:
+  user: YWRtaW4=
+  pass: MWYyZDFlMmU2N2Rm
+```
+
+注意：data的value需要使用base64编码
+
+```
+$ echo -n 'admin' | base64
+YWRtaW4=
+$ echo -n '1f2d1e2e67df' | base64
+MWYyZDFlMmU2N2Rm
+```
+
+
+
+在pod声明volumn使用：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-projected-volume 
+spec:
+  containers:
+  - name: test-secret-volume
+    image: busybox
+    args:
+    - sleep
+    - "86400"
+    volumeMounts:
+    - name: mysql-cred
+      mountPath: "/projected-volume"
+      readOnly: true
+  volumes:
+  - name: mysql-cred
+    projected:
+      sources:
+      - secret:
+          name: user
+      - secret:
+          name: pass
+
+```
+
+==》进入容器查看内容
+
+```bash
+$ kubectl exec -it test-projected-volume -- /bin/sh
+$ ls /projected-volume/
+user
+pass
+$ cat /projected-volume/user
+root
+$ cat /projected-volume/pass
+1f2d1e2e67df
+
+```
+
+
+
+> ConfigMap
+
+与secret相似，只是数据不加密
+
+
+
+> **Downward API**
+
+作用是：让 Pod 里的容器能够直接获取到这个 Pod API 对象本身的信息
+
+例子：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-downwardapi-volume
+  labels:
+    zone: us-est-coast
+    cluster: test-cluster1
+    rack: rack-22
+spec:
+  containers:
+    - name: client-container
+      image: k8s.gcr.io/busybox
+      command: ["sh", "-c"]
+      args:
+      - while true; do
+          if [[ -e /etc/podinfo/labels ]]; then
+            echo -en '\n\n'; cat /etc/podinfo/labels; fi;
+          sleep 5;
+        done;
+      volumeMounts:
+        - name: podinfo
+          mountPath: /etc/podinfo
+          readOnly: false
+  volumes:
+    - name: podinfo
+      projected:
+        sources:
+        - downwardAPI:
+            items:
+              - path: "labels"
+                fieldRef:
+                  fieldPath: metadata.labels
+
+```
+
+
+
+内容：
+
+```
+$ kubectl create -f dapi-volume.yaml
+$ kubectl logs test-downwardapi-volume
+cluster="test-cluster1"
+rack="rack-22"
+zone="us-est-coast"
+
+```
+
+
+
+目前，Downward API 支持的字段已经非常丰富了，比如：
+
+```
+1. 使用fieldRef可以声明使用:
+spec.nodeName - 宿主机名字
+status.hostIP - 宿主机IP
+metadata.name - Pod的名字
+metadata.namespace - Pod的Namespace
+status.podIP - Pod的IP
+spec.serviceAccountName - Pod的Service Account的名字
+metadata.uid - Pod的UID
+metadata.labels['<KEY>'] - 指定<KEY>的Label值
+metadata.annotations['<KEY>'] - 指定<KEY>的Annotation值
+metadata.labels - Pod的所有Label
+metadata.annotations - Pod的所有Annotation
+
+2. 使用resourceFieldRef可以声明使用:
+容器的CPU limit
+容器的CPU request
+容器的memory limit
+容器的memory request
+
+```
+
+需要注意的是，Downward API 能够获取到的信息，**一定是 Pod 里的容器进程启动之前就能够确定下来的信息**。而如果你想要获取 Pod 容器运行后才会出现的信息，比如，容器进程的 PID，那就肯定不能使用 Downward API 了，而应该考虑在 Pod 里定义一个 sidecar 容器。
+
+
+
+> **ServiceAccountToken**
+
+为了方便使用，Kubernetes 已经为你提供了一个默认“服务账户”（default Service Account）。并且，任何一个运行在 Kubernetes 里的 Pod，都可以直接使用这个默认的 Service Account，而无需显示地声明挂载它。
+
+如果你查看一下任意一个运行在 Kubernetes 集群里的 Pod，就会发现，每一个 Pod，都已经自动声明一个类型是 Secret、名为 default-token-xxxx 的 Volume，然后 自动挂载在每个容器的一个固定目录上。
+
+<img src="深入剖析Kubernetes.assets/image-20240221200203769.png" alt="image-20240221200203769" style="zoom:50%;" />
+
+对应的yaml文件：
+
+```
+# kubectl get pod nginx-64c59f7fd4-5sr8t  -o yaml
+.....
+spec:
+  containers:
+  - image: nginx:1.14-alpine
+    xxx
+    volumeMounts:
+    - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+      name: kube-api-access-rx2jb
+      readOnly: true
+  volumes:
+  - name: kube-api-access-rx2jb
+    projected:
+      defaultMode: 420
+      sources:
+      - serviceAccountToken:
+          expirationSeconds: 3607
+          path: token
+      - configMap:
+          items:
+          - key: ca.crt
+            path: ca.crt
+          name: kube-root-ca.crt
+      - downwardAPI:
+          items:
+          - fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+            path: namespace
+```
+
+进入容器查看：
+
+```bash
+# kubectl  exec -it nginx-64c59f7fd4-5sr8t /bin/sh
+/ # ls /var/run/secrets/kubernetes.io/serviceaccount
+ca.crt     namespace  token
+/ # cat /var/run/secrets/kubernetes.io/serviceaccount/token 
+eyJhbGciOiJSUzxxxxxxx
+```
+
+
+
+**这种把 Kubernetes 客户端以容器的方式运行在集群里，然后使用 default Service Account 自动授权的方式，被称作“InClusterConfig”，也是我最推荐的进行 Kubernetes API 编程的授权方式。**
+
+当然，考虑到自动挂载默认 ServiceAccountToken 的潜在风险，Kubernetes 允许你设置默认不为 Pod 里的容器自动挂载这个 Volume。
+
+
+
+### 容器健康检查和恢复机制
+
+存活钩子：livenessProbe
+
+例子：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    test: liveness
+  name: test-liveness-exec
+spec:
+  containers:
+  - name: liveness
+    image: busybox
+    args:
+    - /bin/sh
+    - -c
+    - touch /tmp/healthy; sleep 30; rm -rf /tmp/healthy; sleep 600
+    livenessProbe:
+      exec:
+        command:
+        - cat
+        - /tmp/healthy
+      initialDelaySeconds: 5
+      periodSeconds: 5
+
+```
+
+
+
+而创建pod 30 s 之后，我们再查看一下 Pod 的 Events：
+
+```
+$ kubectl describe pod test-liveness-exec
+```
+
+你会发现，这个 Pod 在 Events 报告了一个异常：
+
+```
+Events:
+  Type     Reason     Age              From               Message
+  ----     ------     ----             ----               -------
+  Normal   Created    41s              kubelet            Created container liveness
+  Normal   Started    41s              kubelet            Started container liveness
+  Warning  Unhealthy  1s (x2 over 6s)  kubelet            Liveness probe failed: cat: can't open '/tmp/healthy': No such file or directory
+```
+
+
+
+我们不妨再次查看一下这个 Pod 的状态：
+
+```bash
+$ kubectl get pod test-liveness-exec
+NAME           READY     STATUS    RESTARTS   AGE
+liveness-exec   1/1       Running   1          1m
+
+```
+
+这时我们发现，Pod 并没有进入 Failed 状态，而是保持了 Running 状态。这是为什么呢？
+
+其实，如果你注意到 **RESTARTS 字段**从 0 到 1 的变化，就明白原因了：这个异常的容器已经被 Kubernetes 重启了。在这个过程中，Pod 保持 Running 状态不变。
+
+需要注意的是：Kubernetes 中并没有 Docker 的 Stop 语义。所以虽然是 Restart（重启），但实际却是重新创建了容器。
+
+这个功能就是 Kubernetes 里的 **Pod 恢复机制**，也叫 **restartPolicy**。它是 Pod 的 Spec 部分的一个标准字段（pod.spec.restartPolicy），默认值是 Always：
+
+- Always：在任何情况下，**只要容器不在运行状态**，就自动重启容器（重建）；
+- OnFailure: 只在容器 异常时才自动重启容器；
+- Never: 从来不重启容器。
+
+如果你要**关心这个容器退出后的上下文环境**，比如容器退出后的日志、文件和目录，就需要将 restartPolicy 设置为 Never。因为一旦容器被自动重新创建，这些内容就有可能丢失掉了（被垃圾回收了）
+
+
+
+记住如下两个基本的设计原理：
+
+1. **只要 Pod 的 restartPolicy 指定的策略允许重启异常的容器（比如：Always），那么这个 Pod 就会保持 Running 状态，并进行容器重启**。否则，Pod 就会进入 Failed 状态 。
+2. **对于包含多个容器的 Pod，只有它里面所有的容器都进入异常状态后，Pod 才会进入 Failed 状态**。在此之前，Pod 都是 Running 状态。此时，Pod 的 READY 字段会显示正常容器的个数，比如：
+
+```bash
+$ kubectl get pod test-liveness-exec
+NAME           READY     STATUS    RESTARTS   AGE
+liveness-exec   0/1       Running   1          1m
+```
+
+
+
+在 Kubernetes 的 Pod 中，还有一个叫 readinessProbe 的字段。虽然它的用法与 livenessProbe 类似，但作用却大不一样。
+
+readinessProbe 检查结果的成功与否，决定的这个 Pod 是不是能被通过 Service 的方式访问到（是否能够对外提供服务），而并不影响 Pod 的生命周期。
+
+
+
+>  PodPreset（Pod 预设置）
+
+详见：https://jimmysong.io/kubernetes-handbook/concepts/pod-preset.html
+
+Kubernetes 能不能自动给 Pod 填充某些字段呢？
+
+这个需求实际上非常实用。比如，开发人员只需要提交一个基本的、非常简单的 Pod YAML，Kubernetes 就可以自动给对应的 Pod 对象加上其他必要的信息，比如 labels，annotations，volumes 等等。而这些信息，可以是运维人员事先定义好的。
+
+这么一来，开发人员编写 Pod YAML 的门槛，就被大大降低了。所以，这个叫作 PodPreset（Pod 预设置）的功能 已经出现在了 v1.11 版本的 Kubernetes 中。
+
+举个例子，现在开发人员编写了如下一个 pod.yaml 文件：
+
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: website
+  labels:
+    app: website
+    role: frontend
+spec:
+  containers:
+    - name: website
+      image: nginx
+      ports:
+        - containerPort: 80
+
+```
+
+
+
+运维人员就可以定义一个 PodPreset 对象。在这个对象中，凡是他想在开发人员编写的 Pod 里追加的字段，都可以预先定义好。比如这个 preset.yaml：
+
+```
+apiVersion: settings.k8s.io/v1alpha1
+kind: PodPreset
+metadata:
+  name: allow-database
+spec:
+  selector:
+    matchLabels:
+      role: frontend
+  env:
+    - name: DB_PORT
+      value: "6379"
+  volumeMounts:
+    - mountPath: /cache
+      name: cache-volume
+  volumes:
+    - name: cache-volume
+      emptyDir: {}
+```
+
+在这个 PodPreset 的定义中，首先是一个 selector。这就意味着后面这些追加的定义，只会作用于 selector 所定义的、带有“role: frontend”标签的 Pod 对象，这就可以防止“误伤”。
+
+接下来，我们假定运维人员先创建了这个 PodPreset，然后开发人员才创建 Pod：
+
+```
+$ kubectl create -f preset.yaml
+$ kubectl create -f pod.yaml
+```
+
+这时，Pod 运行起来之后，我们查看一下这个 Pod 的 API 对象：
+
+```
+$ kubectl get pod website -o yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: website
+  labels:
+    app: website
+    role: frontend
+  annotations:
+    podpreset.admission.kubernetes.io/podpreset-allow-database: "resource version"
+spec:
+  containers:
+    - name: website
+      image: nginx
+      volumeMounts:
+        - mountPath: /cache
+          name: cache-volume
+      ports:
+        - containerPort: 80
+      env:
+        - name: DB_PORT
+          value: "6379"
+  volumes:
+    - name: cache-volume
+      emptyDir: {}
+```
+
+这个时候，我们就可以清楚地看到，这个 Pod 里多了新添加的 labels、env、volumes 和 volumeMount 的定义，它们的配置跟 PodPreset 的内容一样。此外，这个 Pod 还被自动加上了一个 annotation 表示这个 Pod 对象被 PodPreset 改动过。
+
+需要说明的是，**PodPreset 里定义的内容，只会在 Pod API 对象被创建之前追加在这个对象本身上，而不会影响任何 Pod 的控制器的定义。**
+
+比如，我们现在提交的是一个 nginx-deployment，那么这个 Deployment 对象本身是永远不会被 PodPreset 改变的，被修改的只是这个 Deployment 创建出来的所有 Pod。
+
+这里有一个问题：如果你定义了同时作用于一个 Pod 对象的多个 PodPreset，会发生什么呢？实际上，Kubernetes 项目会帮你**合并（Merge）**这两个 PodPreset 要做的修改。而如果它们要做的修改有冲突的话，这些**冲突字段就不会被修改**。
+
+
+
+### 总结
+
+认真体会一下 Kubernetes“一切皆对象”的设计思想：比如应用是 Pod 对象，应用的配置是 ConfigMap 对象，应用要访问的密码则是 Secret 对象。
+
+所以，也就自然而然地有了 PodPreset 这样专门用来对 Pod 进行批量化、自动化修改的工具对象。
+
+
+
+
+
+## 16 编排其实很简单：谈谈“控制器”模型
+
+
+
+前面介绍 Kubernetes 架构的时候，曾经提到过一个叫作 **kube-controller-manager** 的组件。
+
+实际上，这个组件，就是一系列控制器的集合。我们可以查看一下 Kubernetes 项目的 pkg/controller 目录：
+
+```
+$ cd kubernetes/pkg/controller/
+$ ls -d */              
+deployment/             job/                    podautoscaler/          
+cloud/                  disruption/             namespace/              
+replicaset/             serviceaccount/         volume/
+cronjob/                garbagecollector/       nodelifecycle/          replication/            statefulset/            daemon/
+...
+```
+
+<img src="深入剖析Kubernetes.assets/image-20240223171749147.png" alt="image-20240223171749147" style="zoom:50%;" />
+
+
+
+它们都遵循 Kubernetes 项目中的一个通用编排模式，即：控制循环（control loop）。
+
+比如，现在有一种待编排的对象 X，它有一个对应的控制器。那么，我就可以用一段 Go 语言风格的伪代码，为你描述这个**控制循环**：
+
+```go
+for {
+  实际状态 := 获取集群中对象X的实际状态（Actual State）
+  期望状态 := 获取集群中对象X的期望状态（Desired State）
+  if 实际状态 == 期望状态{
+    什么都不做
+  } else {
+    执行编排动作，将实际状态调整为期望状态
+  }
+}
+```
+
+**在具体实现中，实际状态往往来自于 Kubernetes 集群本身**。
+
+比如，kubelet 通过心跳汇报的容器状态和节点状态，或者监控系统中保存的应用监控数据，或者控制器主动收集的它自己感兴趣的信息，这些都是常见的实际状态的来源。
+
+**而期望状态，一般来自于用户提交的 YAML 文件**。
+
+比如，Deployment 对象中 Replicas 字段的值。很明显，这些信息往往都保存在 Etcd 中。
+
+接下来，以 Deployment 为例，我和你简单描述一下它对控制器模型的实现：
+
+1. Deployment 控制器从 Etcd 中获取到所有携带了“app: nginx”标签的 Pod，然后统计它们的数量，这就是实际状态；
+2. Deployment 对象的 Replicas 字段的值就是期望状态；
+3. Deployment 控制器将两个状态做比较，然后根据比较结果，确定是创建 Pod，还是删除已有的 Pod（具体如何操作 Pod 对象，我会在下一篇文章详细介绍）。
+
+可以看到，一个 Kubernetes 对象的主要编排逻辑，实际上是在第三步的“对比”阶段完成的。
+
+这个操作，通常被叫作**调谐（Reconcile）**。这个调谐的过程，则被称作“Reconcile Loop”（调谐循环）或者“Sync Loop”（同步循环）。
+
+
+
+我们就可以对 Deployment 以及其他类似的控制器，做一个简单总结了：
+
+<img src="深入剖析Kubernetes.assets/72cc68d82237071898a1d149c8354b26.png" alt="img" style="zoom:50%;" />
+
+如上图所示，**类似 Deployment 这样的一个控制器，实际上都是由上半部分的控制器定义（包括期望状态），加上下半部分的被控制对象的模板组成的。**
+
+
+
+在所有 API 对象的 Metadata 里，都有一个字段叫作 ownerReference，用于保存当前这个 API 对象的拥有者（Owner/parent）的信息。
+
+```yaml
+# pod =》replicaSet =》deployment
+# kubectl get pod deploy-nginx-7f7499b7f6-w7j7g -n dev -o yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  creationTimestamp: "2024-01-26T03:38:29Z"
+  generateName: deploy-nginx-7f7499b7f6-
+  labels:
+    app: nginx
+    pod-template-hash: 7f7499b7f6
+  name: deploy-nginx-7f7499b7f6-w7j7g
+  namespace: dev
+  ownerReferences:
+  - apiVersion: apps/v1
+    blockOwnerDeletion: true
+    controller: true
+    kind: ReplicaSet
+    name: deploy-nginx-7f7499b7f6
+    uid: 05bb20df-132e-41b9-a067-e326d2efd1fd
+  resourceVersion: "891063"
+  uid: 53571663-3349-4f6e-9f42-a731fab7d9ec
+  
+# kubectl get rs deploy-nginx-7f7499b7f6  -n dev -o yaml
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  annotations:
+    deployment.kubernetes.io/desired-replicas: "1"
+    deployment.kubernetes.io/max-replicas: "2"
+    deployment.kubernetes.io/revision: "2"
+  creationTimestamp: "2024-01-26T03:38:29Z"
+  generation: 3
+  labels:
+    app: nginx
+    pod-template-hash: 7f7499b7f6
+  name: deploy-nginx-7f7499b7f6
+  namespace: dev
+  ownerReferences:
+  - apiVersion: apps/v1
+    blockOwnerDeletion: true
+    controller: true
+    kind: Deployment
+    name: deploy-nginx
+    uid: 0221fca2-ce9d-4c82-a04b-94012ef5f20a
+  resourceVersion: "1364013"
+  uid: 05bb20df-132e-41b9-a067-e326d2efd1fd
+```
+
+
+
+### 总结
+
+在今天这篇文章中，我以 Deployment 为例，和你详细分享了 Kubernetes 项目如何通过一个称作**“控制器模式”（controller pattern）**的设计方法，来统一地实现对各种不同的对象或者资源进行的编排操作。
+
+
+
+在后面的讲解中，我还会讲到很多不同类型的容器编排功能，比如 StatefulSet、DaemonSet 等等，它们无一例外地都有这样一个甚至多个控制器的存在，并遵循控制循环（control loop）的流程，完成各自的编排逻辑。
+
+实际上，跟 Deployment 相似，这些控制循环最后的执行结果，要么就是创建、更新一些 Pod（或者其他的 API 对象、资源），要么就是删除一些已经存在的 Pod（或者其他的 API 对象、资源）。
+
+但也正是在这个统一的编排框架下，不同的控制器可以在具体执行过程中，设计不同的业务逻辑，从而达到不同的编排效果。
+
+
+
+这个实现思路，正是 Kubernetes 项目进行容器编排的核心原理。在此后讲解 Kubernetes 编排功能的文章中，我都会遵循这个逻辑展开，并且带你逐步领悟控制器模式在不同的容器化作业中的实现方式。
+
+### 思考题
+
+你能否说出，Kubernetes 使用的这个“控制器模式”，跟我们平常所说的“事件驱动”，有什么区别和联系吗？
+
+
+
+当谈到 Kubernetes 中的 "控制器模式" 和 "事件驱动" 时，它们实际上是相关但不完全相同的概念。
+
+1. 控制器模式（Controller Pattern）：在 Kubernetes 中，控制器模式是一种用于管理和维护系统状态的设计模式。控制器负责监视集群中的资源对象，并根据定义的规则和策略对这些资源进行操作和调节。控制器可以确保所需的状态和配置与期望的状态保持一致，以实现系统的自动化管理和调整。控制器模式的一个常见示例是 ReplicaSet 控制器，它负责确保指定数量的 Pod 实例在集群中运行。
+2. 事件驱动（Event-Driven）：事件驱动是一种编程模型，其中系统的行为和响应是由事件的发生和触发来驱动的。在事件驱动的环境中，组件（或服务）通过订阅和处理事件来实现异步通信和协作。当事件发生时，相关的组件将触发相应的处理逻辑。在 Kubernetes 中，事件驱动的概念通常与事件处理器（Event Handlers）和事件触发器（Event Triggers）相关联，用于在资源状态发生变化时触发相应的操作。
+
+联系和区别：
+
+- 联系：控制器模式和事件驱动都是用于管理和调节系统状态的方法。它们都关注系统中的资源和状态变化，并根据这些变化触发相应的操作。
+- 区别：控制器模式更侧重于定义和实现对资源的管理和调节策略，以确保系统状态的一致性和可靠性。而事件驱动更侧重于通过事件的发生和触发来驱动系统的行为和协作，以实现异步通信和处理。
+
+在 Kubernetes 中，控制器模式和事件驱动可以结合使用。例如，Kubernetes 的控制器可以通过监听资源对象的事件来触发相应的操作，以保持系统状态的一致性。这种结合使用可以实现更灵活和自动化的系统管理和调节。
+
+
+
+## 17 经典PaaS的记忆：作业副本与水平扩展
+
+
+
+**Deployment 控制器实际操纵的，正是这样的 ReplicaSet 对象，而不是 Pod 对象。**
+
+<img src="深入剖析Kubernetes.assets/711c07208358208e91fa7803ebc73058.jpg" alt="img" style="zoom:25%;" />
+
+
+
+通过这张图，我们就很清楚地看到，一个定义了 replicas=3 的 Deployment，与它的 ReplicaSet，以及 Pod 的关系，实际上是一种“层层控制”的关系。
+
+其中，ReplicaSet 负责通过“控制器模式”，保证系统中 Pod 的个数永远等于指定的个数（比如，3 个）。这也正是 Deployment 只允许容器的 restartPolicy=Always 的主要原因：只有在容器能保证自己始终是 Running 状态的前提下，ReplicaSet 调整 Pod 的个数才有意义。
+
+而在此基础上，Deployment 同样通过“控制器模式”，来操作 ReplicaSet 的个数和属性，进而实现“水平扩展 / 收缩”和“滚动更新”这两个编排动作。
+
+> “水平扩展 / 收缩”
+
+“水平扩展 / 收缩”非常容易实现，Deployment Controller 只需要修改它所控制的 ReplicaSet 的 Pod 副本个数就可以了（不會重新創建新的rs）。
+
+可以用指令实现：
+
+```bash
+$ kubectl scale deployment nginx-deployment --replicas=4
+deployment.apps/nginx-deployment scaled
+```
+
+
+
+> 滚动更新
+
+會重新创建一个rs，然后新增一个pod，旧的rs减少一个pod，交替进行，直至完成滚动更新。
+
+一起分析一个如下所示的 Deployment：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-deployment
+  labels:
+    app: nginx
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.7.9
+        ports:
+        - containerPort: 80
+
+```
+
+然后，我们来检查一下 nginx-deployment 创建后的状态信息：
+
+```
+$ kubectl get deploymentsNAME              
+DESIRED   CURRENT   UP-TO-DATE   AVAILABLE   AGEnginx-deployment  
+3         0         0            0           1s
+```
+
+在返回结果中，我们可以看到四个状态字段，它们的含义如下所示。
+
+1. DESIRED：用户期望的 Pod 副本个数（spec.replicas 的值）；
+2. CURRENT：当前处于 Running 状态的 Pod 的个数；
+3. UP-TO-DATE：当前处于最新版本的 Pod 的个数，所谓最新版本指的是 Pod 的 Spec 部分与 Deployment 里 Pod 模板里定义的完全一致；
+4. AVAILABLE：当前已经可用的 Pod 的个数，即：既是 Running 状态，又是最新版本，并且已经处于 Ready（健康检查正确）状态的 Pod 的个数。
+
+可以看到，只有这个 AVAILABLE 字段，描述的才是用户所期望的最终状态。
+
+
+
+而 Kubernetes 项目还为我们提供了一条指令，让我们可以实时查看 Deployment 对象的状态变化。这个指令就是 kubectl rollout status：
+
+```bash
+$ kubectl rollout status deployment/nginx-deployment
+Waiting for rollout to finish: 2 out of 3 new replicas have been updated...
+deployment.apps/nginx-deployment successfully rolled out
+```
+
+此时，你可以尝试查看一下这个 Deployment 所控制的 ReplicaSet：
+
+```
+$ kubectl get rs
+NAME                          DESIRED   CURRENT   READY   AGE
+nginx-deployment-3167673210   3         3         3       20s
+```
+
+ReplicaSet 的名字后面随机字符串叫作 pod-template-hash，ReplicaSet 会把这个随机字符串加在它所控制的所有 Pod 的标签里，从而保证这些 Pod 不会与集群里的其他 Pod 混淆。
+
+```yaml
+# kubectl get pod nginx-deployment-9d6cbcc65-rgz6b -o yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  creationTimestamp: "2024-02-23T09:43:07Z"
+  generateName: nginx-deployment-9d6cbcc65-
+  labels:
+    app: nginx
+    pod-template-hash: 9d6cbcc65
+  name: nginx-deployment-9d6cbcc65-rgz6b
+```
+
+修改容器的镜像版本触发滚动更新。
+
+```
+$ kubectl edit deployment/nginx-deployment
+... 
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.9.1 # 1.7.9 -> 1.9.1
+        ports:
+        - containerPort: 80
+...
+deployment.extensions/nginx-deployment edited
+```
+
+这时，你可以通过查看 Deployment 的 Events，看到这个“滚动更新”的流程：
+
+```
+$ kubectl describe deployment nginx-deployment
+...
+Events:
+  Type    Reason             Age   From                   Message
+  ----    ------             ----  ----                   -------
+...
+  Normal  ScalingReplicaSet  24s   deployment-controller  Scaled up replica set nginx-deployment-1764197365 to 1
+  Normal  ScalingReplicaSet  22s   deployment-controller  Scaled down replica set nginx-deployment-3167673210 to 2
+  Normal  ScalingReplicaSet  22s   deployment-controller  Scaled up replica set nginx-deployment-1764197365 to 2
+  Normal  ScalingReplicaSet  19s   deployment-controller  Scaled down replica set nginx-deployment-3167673210 to 1
+  Normal  ScalingReplicaSet  19s   deployment-controller  Scaled up replica set nginx-deployment-1764197365 to 3
+  Normal  ScalingReplicaSet  14s   deployment-controller  Scaled down replica set nginx-deployment-3167673210 to 0
+```
+
+首先，当你修改了 Deployment 里的 Pod 定义之后，Deployment Controller 会使用这个修改后的 Pod 模板，创建一个新的 ReplicaSet（hash=1764197365），这个新的 ReplicaSet 的初始 Pod 副本数是：0。
+
+然后，在 Age=24 s 的位置，Deployment Controller 开始将这个新的 ReplicaSet 所控制的 Pod 副本数从 0 个变成 1 个，即：“水平扩展”出一个副本。
+
+紧接着，在 Age=22 s 的位置，Deployment Controller 又将旧的 ReplicaSet（hash=3167673210）所控制的旧 Pod 副本数减少一个，即：“水平收缩”成两个副本。
+
+如此交替进行，新 ReplicaSet 管理的 Pod 副本数，从 0 个变成 1 个，再变成 2 个，最后变成 3 个。而旧的 ReplicaSet 管理的 Pod 副本数则从 3 个变成 2 个，再变成 1 个，最后变成 0 个。这样，就完成了这一组 Pod 的版本升级过程。
+
+```bash
+# kubectl get rs
+NAME                          DESIRED   CURRENT   READY   AGE
+nginx-deployment-7ffd5c8dc9   3         3         3       7m5s
+nginx-deployment-9d6cbcc65    0         0         0       17m
+```
+
+
+
+配置滚动更新策略：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-deployment
+  labels:
+    app: nginx
+spec:
+...
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1  # 最多多创建的pod，默认25%
+      maxUnavailable: 1 # 最大的不可用pod，默认25%
+```
+
+
+
+> 回滚操作
+
+ **kubectl set image**  直接修改 nginx-deployment 所使用的镜像，但把这个镜像名字修改成为了一个错误的名字，比如：nginx:1.91。这样，这个 Deployment 就会出现一个升级失败的版本。
+
+```
+$ kubectl set image deployment/nginx-deployment nginx=nginx:1.91
+deployment.extensions/nginx-deployment image updated
+```
+
+我们来检查一下 ReplicaSet 的状态，如下所示：
+
+```
+$ kubectl get rs
+NAME                          DESIRED   CURRENT   READY   AGE
+nginx-deployment-1764197365   2         2         2       24s
+nginx-deployment-2156724341   2         2         0       7s
+```
+
+
+
+我们只需要执行一条 kubectl rollout undo 命令，就能把整个 Deployment 回滚到上一个版本：
+
+```bash
+[root]# kubectl rollout undo deployment/nginx-deployment
+deployment.apps/nginx-deployment rolled back
+
+[root]# kubectl get rs
+NAME                          DESIRED   CURRENT   READY   AGE
+nginx-deployment-7ffd5c8dc9   3         3         3       83m
+nginx-deployment-b59f7f787    0         0         0       4m15s
+```
+
+更进一步地，如果我想回滚到更早之前的版本，要怎么办呢？
+
+**首先，我需要使用 kubectl rollout history 命令，查看每次 Deployment 变更对应的版本**。而由于我们在创建这个 Deployment 的时候，指定了–record 参数，所以我们创建这些版本时执行的 kubectl 命令，都会被记录下来（spec.revisionHistoryLimit 字段控制保留的历史版本数，默认3）。
+
+```bash
+$ kubectl rollout history deployment/nginx-deployment
+deployments "nginx-deployment"
+REVISION    CHANGE-CAUSE
+1           kubectl create -f nginx-deployment.yaml --record
+2           kubectl edit deployment/nginx-deployment
+3           kubectl set image deployment/nginx-deployment nginx=nginx:1.91
+
+# 查看具体版本信息
+$ kubectl rollout history deployment/nginx-deployment --revision=1
+deployment.apps/nginx-deployment with revision #1
+Pod Template:
+  Labels:       app=nginx
+        pod-template-hash=9d6cbcc65
+  Annotations:  kubernetes.io/change-cause: kubectl create --filename=nginx-deployment.yaml --record=true
+  Containers:
+   nginx:
+    Image:      nginx:1.7.9
+    Port:       80/TCP
+    Host Port:  0/TCP
+    Environment:        <none>
+    Mounts:     <none>
+  Volumes:      <none>
+```
+
+
+
+**然后，我们就可以在 kubectl rollout undo 命令行最后，加上要回滚到的指定版本的版本号，就可以回滚到指定版本了**。这个指令的用法如下：
+
+```
+$ kubectl rollout undo deployment/nginx-deployment --to-revision=2
+deployment.extensions/nginx-deployment
+```
+
+
+
+不过，你可能已经想到了一个问题：我们对 Deployment 进行的每一次更新操作，都会生成一个新的 ReplicaSet 对象，是不是有些多余，甚至浪费资源呢？
+
+没错。
+
+所以，Kubernetes 项目还提供了一个指令，**使得我们对 Deployment 的多次更新操作，最后 只生成一个 ReplicaSet**。
+
+具体的做法是，在更新 Deployment 前，你要先执行一条 kubectl rollout pause 指令。它的用法如下所示：
+
+```
+$ kubectl rollout pause deployment/nginx-deployment
+deployment.extensions/nginx-deployment paused
+```
+
+这个 kubectl rollout pause 的作用，是让这个 Deployment 进入了一个“暂停”状态。
+
+所以接下来，你就可以随意使用 kubectl edit 或者 kubectl set image 指令，修改这个 Deployment 的内容了。
+
+由于此时 Deployment 正处于“暂停”状态，所以我们对 Deployment 的所有修改，都不会触发新的“滚动更新”，也不会创建新的 ReplicaSet。
+
+而等到我们对 Deployment 修改操作都完成之后，只需要再执行一条 kubectl rollout resume 指令，就可以把这个 Deployment“恢复”回来，如下所示：
+
+```bash
+$ kubectl rollout resume deployment/nginx-deployment
+deployment.extensions/nginx-deployment resumed
+```
+
+而在这个 kubectl rollout resume 指令执行之前，在 kubectl rollout pause 指令之后的这段时间里，我们对 Deployment 进行的所有修改，最后只会触发一次“滚动更新”。
+
+
+
 
 
 # Kubernetes容器持久化存储
