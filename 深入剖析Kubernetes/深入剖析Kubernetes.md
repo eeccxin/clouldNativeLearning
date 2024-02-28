@@ -2290,6 +2290,385 @@ deployment.extensions/nginx-deployment resumed
 
 
 
+## 22 撬动离线业务：Job与CronJob
+
+​		Deployment、StatefulSet，以及 DaemonSet 主要编排的对象，都是“在线业务”，即：Long Running Task（长作业）。
+
+​		还有一类作业是“离线业务”，或者叫作 Batch Job（计算业务），这种业务在计算完成后就直接退出了，k8s中的Job和CronJob。
+
+​		早在 Borg 项目（2015 年）中，Google 就已经对作业进行了分类处理，提出了 LRS（Long Running Service）和 Batch Jobs 两种作业形态，对它们进行“分别管理”和“混合调度”。
+
+
+
+### Job
+
+#### 例子
+
+例子：
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pi
+spec:
+  template:
+    spec:
+      containers:
+      - name: pi
+        image: resouer/ubuntu-bc 
+        command: ["sh", "-c", "echo 'scale=10000; 4*a(1)' | bc -l "]
+      restartPolicy: Never
+  backoffLimit: 4
+```
+
+创建这个 Job并查看：
+
+```bash
+$ kubectl create -f job.yaml
+$ kubectl describe jobs/pi
+Name:             pi
+Namespace:        default
+Selector:         controller-uid=c2db599a-2c9d-11e6-b324-0209dc45a495
+Labels:           controller-uid=c2db599a-2c9d-11e6-b324-0209dc45a495
+                  job-name=pi
+Annotations:      <none>
+Parallelism:      1
+Completions:      1
+..
+Pods Statuses:    0 Running / 1 Succeeded / 0 Failed
+Pod Template:
+  Labels:       controller-uid=c2db599a-2c9d-11e6-b324-0209dc45a495
+                job-name=pi
+  Containers:
+   ...
+  Volumes:              <none>
+Events:
+  FirstSeen    LastSeen    Count    From            SubobjectPath    Type        Reason            Message
+  ---------    --------    -----    ----            -------------    --------    ------            -------
+  1m           1m          1        {job-controller }                Normal      SuccessfulCreate  Created pod: pi-rq5rl
+
+```
+
+可以看到，这个 Job 对象在创建后，它的 Pod 模板，被自动加上了一个 controller-uid=< 一个随机字符串 > 这样的 **Label**。而这个 Job 对象本身，则被自动加上了这个 Label 对应的 **Selector**，从而 保证了 Job 与它所管理的 Pod 之间的匹配关系。
+
+
+
+我们可以看到这个 Job 创建的 Pod 进入了 Running 状态，这意味着它正在计算 Pi 的值。
+
+```
+$ kubectl get pods
+NAME                                READY     STATUS    RESTARTS   AGE
+pi-rq5rl                            1/1       Running   0          10s
+```
+
+而几分钟后计算结束，这个 Pod 就会进入 Completed 状态：
+
+```
+$ kubectl get pods
+NAME                                READY     STATUS      RESTARTS   AGE
+pi-rq5rl                            0/1       Completed   0          4m
+```
+
+这也是我们需要在 Pod 模板中定义 restartPolicy=Never 的原因：离线计算的 Pod 永远都不应该被重启，否则它们会再重新计算一遍。
+
+job的template不加Never也会自动设置吧？
+
+事实上，**restartPolicy 在 Job 对象里只允许被设置为 Never 和 OnFailure**；而在 Deployment 对象里，restartPolicy 则只允许被设置为 Always。
+
+此时，我们通过 kubectl logs 查看一下这个 Pod 的日志，就可以看到计算得到的 Pi 值已经被打印了出来：
+
+```BASH
+$ kubectl logs pi-rq5rl
+3.141592653589793238462643383279...
+```
+
+
+
+> 一些字段
+
+```
+spec:
+ backoffLimit: 6
+ activeDeadlineSeconds: 100
+```
+
+- spec.activeDeadlineSeconds 字段可以设置最长运行时间，一旦运行超时，这个 Job 的所有 Pod 都会被终止，并且，你可以在 Pod 的状态里看到终止的原因是 reason: DeadlineExceeded
+- backoffLimit 字段里定义了重试次数，默认值是 6。
+- spec.parallelism，它定义的是一个 Job 在任意时间最多可以启动多少个 Pod 同时运行；
+- spec.completions，它定义的是 Job 至少要完成的 Pod 数目，即 Job 的最小完成数
+
+
+
+并行度例子：
+
+```
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pi
+spec:
+  parallelism: 2
+  completions: 4
+  template:
+    spec:
+      containers:
+      - name: pi
+        image: resouer/ubuntu-bc
+        command: ["sh", "-c", "echo 'scale=5000; 4*a(1)' | bc -l "]
+      restartPolicy: Never
+  backoffLimit: 4
+```
+
+
+
+```
+# kubectl create -f job.yaml
+job.batch/pi created
+
+# kubectl get job
+NAME   COMPLETIONS   DURATION   AGE
+pi     0/4           8s         8s
+```
+
+COMPLETIONS == SUCCESSFUL/DESIRED
+
+
+
+可以看到，每当有一个 Pod 完成计算进入 Completed 状态时，就会有一个新的 Pod 被自动创建出来，并且快速地从 Pending 状态进入到 ContainerCreating 状态：
+
+```
+$ kubectl get pods
+NAME       READY     STATUS    RESTARTS   AGE
+pi-gmcq5   0/1       Completed   0         40s
+pi-84ww8   0/1       Pending   0         0s
+pi-5mt88   0/1       Completed   0         41s
+pi-62rbt   0/1       Pending   0         0s
+
+$ kubectl get pods
+NAME       READY     STATUS    RESTARTS   AGE
+pi-gmcq5   0/1       Completed   0         40s
+pi-84ww8   0/1       ContainerCreating   0         0s
+pi-5mt88   0/1       Completed   0         41s
+pi-62rbt   0/1       ContainerCreating   0         0s
+
+```
+
+
+
+#### Job Controller 的工作原理
+
+首先，Job Controller 控制的对象，直接就是 Pod。
+
+其次，Job Controller 在控制循环中进行的调谐（Reconcile）操作，是根据实际在 Running 状态 Pod 的数目、已经成功退出的 Pod 的数目，以及 parallelism、completions 参数的值共同计算出在这个周期里，应该创建或者删除的 Pod 数目，然后调用 Kubernetes API 来执行这个操作。
+
+
+
+#### 三种常用的 Job 使用方法
+
+**第一种用法，也是最简单粗暴的用法：外部管理器 +Job 模板。**
+
+这种模式的特定用法是：把 Job 的 YAML 文件定义为一个“模板”，然后用一个外部工具控制这些“模板”来生成 Job。（批量生成job的yaml文件）
+
+这时，Job 的定义方式如下所示：
+
+```
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: process-item-$ITEM
+  labels:
+    jobgroup: jobexample
+spec:
+  template:
+    metadata:
+      name: jobexample
+      labels:
+        jobgroup: jobexample
+    spec:
+      containers:
+      - name: c
+        image: busybox
+        command: ["sh", "-c", "echo Processing item $ITEM && sleep 5"]
+      restartPolicy: Never
+
+```
+
+可以看到，我们在这个 Job 的 YAML 里，定义了 $ITEM 这样的“变量”。
+
+所以，在控制这种 Job 时，我们只要注意如下两个方面即可：
+
+1. 创建 Job 时，替换掉 $ITEM 这样的变量；
+2. 所有来自于同一个模板的 Job，都有一个 jobgroup: jobexample 标签，也就是说这一组 Job 使用这样一个相同的标识。
+
+而做到第一点非常简单。比如，你可以通过这样一句 shell 把 $ITEM 替换掉：
+
+```
+$ mkdir ./jobs
+$ for i in apple banana cherry
+do
+  cat job-tmpl.yaml | sed "s/\$ITEM/$i/" > ./jobs/job-$i.yaml
+done
+
+```
+
+这样，一组来自于同一个模板的不同 Job 的 yaml 就生成了。接下来，你就可以通过一句 kubectl create 指令创建这些 Job 了：
+
+```
+$ kubectl create -f ./jobs
+$ kubectl get pods -l jobgroup=jobexample
+NAME                        READY     STATUS      RESTARTS   AGE
+process-item-apple-kixwv    0/1       Completed   0          4m
+process-item-banana-wrsf7   0/1       Completed   0          4m
+process-item-cherry-dnfu9   0/1       Completed   0          4m
+```
+
+这个模式看起来虽然很“傻”，但却是 Kubernetes 社区里使用 Job 的一个很普遍的模式。
+
+原因很简单：大多数用户在需要管理 Batch Job 的时候，都已经有了一套自己的方案，需要做的往往就是**集成工作**。这时候，Kubernetes 项目对这些方案来说最有价值的，就是 Job 这个 API 对象。所以，你只需要编写一个外部工具（等同于我们这里的 for 循环）来管理这些 Job 即可。
+
+这种模式最典型的应用，就是 TensorFlow 社区的 **KubeFlow 项目**。
+
+很容易理解，在这种模式下使用 Job 对象，completions 和 parallelism 这两个字段都应该使用默认值 1，而不应该由我们自行设置。而作业 Pod 的并行控制，应该完全交由外部工具来进行管理（比如，KubeFlow）。
+
+
+
+**第二种用法：拥有固定任务数目的并行 Job**。
+
+这种模式下，我只关心最后是否有指定数目（spec.completions）个任务成功退出。至于执行时的并行度是多少，我并不关心。
+
+比如，我们这个计算 Pi 值的例子，就是这样一个典型的、拥有固定任务数目（completions=4）的应用场景。 它的 parallelism 值是 2；或者，你可以干脆不指定 parallelism，直接使用默认的并行度（即：1）。
+
+
+
+**第三种用法，也是很常用的一个用法：指定并行度（parallelism），但不设置固定的 completions 的值。**
+
+这时候，Job 的定义基本上没变化，只不过是不再需要定义 completions 的值了而已
+
+```
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job-wq-2
+spec:
+  parallelism: 2
+  template:
+    metadata:
+      name: job-wq-2
+    spec:
+      containers:
+      - name: c
+        image: gcr.io/myproject/job-wq-2
+        env:
+        - name: BROKER_URL
+          value: amqp://guest:guest@rabbitmq-service:5672
+        - name: QUEUE
+          value: job2
+      restartPolicy: OnFailure
+```
+
+
+
+在实际场景里，要么干脆就用第一种用法来自己管理作业；要么，这些任务 Pod 之间的关系就不那么“单纯”，甚至还是“有状态应用”（比如，任务的输入 / 输出是在持久化数据卷里）。在这种情况下，我在后面要重点讲解的 Operator，加上 Job 对象一起，可能才能更好地满足实际离线任务的编排需求。
+
+
+
+### CronJob
+
+```
+apiVersion: batch/v1beta1
+kind: CronJob
+metadata:
+  name: hello
+spec:
+  schedule: "*/1 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: hello
+            image: busybox
+            args:
+            - /bin/sh
+            - -c
+            - date; echo Hello from the Kubernetes cluster
+          restartPolicy: OnFailure
+```
+
+在这个 YAML 文件中，最重要的关键词就是 **jobTemplate**。看到它，你一定恍然大悟，原来 CronJob 是一个 Job 对象的控制器（Controller）！
+
+一些字段：
+
+> concurrencyPolicy
+
+需要注意的是，由于定时任务的特殊性，很可能某个 Job 还没有执行完，另外一个新 Job 就产生了。这时候，你可以通过 spec.concurrencyPolicy 字段来定义具体的处理策略。比如：
+
+1. concurrencyPolicy=Allow，这也是默认情况，这意味着这些 Job 可以同时存在；
+2. concurrencyPolicy=Forbid，这意味着不会创建新的 Pod，该创建周期被跳过；
+3. concurrencyPolicy=Replace，这意味着新产生的 Job 会替换旧的、没有执行完的 Job。
+
+
+
+> spec.startingDeadlineSeconds
+
+而如果某一次 Job 创建失败，这次创建就会被标记为“miss”。当在指定的时间窗口内，miss 的数目达到 100 时，那么 CronJob 会停止再创建这个 Job。
+
+这个时间窗口，可以由 spec.startingDeadlineSeconds 字段指定。比如 startingDeadlineSeconds=200，意味着在过去 200 s 里，如果 miss 的数目达到了 100 次，那么这个 Job 就不会被创建执行了。
+
+
+
+
+
+### 思考題
+
+根据 Job 控制器的工作原理，如果你定义的 parallelism 比 completions 还大的话，比如：
+
+```
+ parallelism: 4
+ completions: 2
+```
+
+那么，这个 Job 最开始创建的时候，会同时启动几个 Pod 呢？原因是什么？
+
+
+
+答：
+
+根据 Job 控制器的工作原理，如果你定义的 `parallelism`（并行度）比 `completions`（完成数）大，例如 `parallelism: 4` 和 `completions: 2`，那么在 Job 最开始创建时，会同时启动 4 个 Pod。
+
+这是因为 `parallelism` 定义了 Job 同时运行的 Pod 的最大数量。而 `completions` 定义了 Job 完成所需的 Pod 的数量。当 Job 创建时，它会尽可能地启动 `parallelism` 个 Pod，以便加快任务的执行速度。
+
+在这种情况下，Job 会启动 4 个 Pod，这些 Pod 将并行地执行任务。然而，由于 `completions` 设置为 2，Job 只有在成功完成 2 个 Pod 后才会被标记为完成。这意味着即使有 4 个 Pod 启动，只有前两个成功完成的 Pod 会被计算在 `completions` 中。
+
+这种设置可以用于实现一些特定的需求，例如在处理大量任务时，通过并行执行多个 Pod 来加快任务的处理速度，并且只需要满足一定数量的成功完成 Pod 来满足 Job 的完成条件。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # Kubernetes容器持久化存储
 
 > PV和PVC
