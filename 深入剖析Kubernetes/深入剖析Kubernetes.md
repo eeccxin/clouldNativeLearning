@@ -5926,7 +5926,7 @@ $ cat /etc/cni/net.d/10-flannel.conflist
 
 ```
 
-需要注意的是，在 Kubernetes 中，**处理容器网络相关的逻辑**并不会在 kubelet 主干代码里执行，而是**会在具体的 CRI（Container Runtime Interface，容器运行时接口）实现里完成**。对于 **Docker 项目来说，它的 CRI 实现叫作 dockershim**，你可以在 kubelet 的代码里找到它。
+需要注意的是，在 Kubernetes 中，**处理容器网络相关的逻辑**并不会在 kubelet 主干代码里执行，而是**会在具体的 CRI（Container Runtime Interface，容器运行时接口）实现里完成**。对于 **Docker 项目来说，它的 CRI 实现叫作 dockershim（垫片）**，你可以在 kubelet 的代码里找到它。
 
 
 
@@ -5946,7 +5946,9 @@ $ cat /etc/cni/net.d/10-flannel.conflist
 
 ### CNI 插件的工作原理
 
-当 kubelet 组件需要创建 Pod 的时候，它第一个创建的一定是 Infra 容器。所以在这一步，dockershim 就会先调用 Docker API 创建并启动 Infra 容器，紧接着执行一个叫作 SetUpPod 的方法。这个方法的作用就是：为 CNI 插件准备参数，然后调用 CNI 插件为 Infra 容器配置网络。
+当 kubelet 组件需要创建 Pod 的时候，它第一个创建的一定是 Infra 容器（infrastructure，基础设施容器）。
+
+所以在这一步，dockershim 就会先调用 Docker API 创建并启动 Infra 容器，紧接着执行一个叫作 SetUpPod 的方法。这个方法的作用就是：为 CNI 插件准备参数，然后调用 CNI 插件为 Infra 容器配置网络。
 
 
 
@@ -5991,7 +5993,9 @@ CNI 的 ADD 操作需要的参数包括：容器里网卡的名字 eth0（CNI_IF
 
 ```
 
-Delegate 字段的意思是，这个 CNI 插件并不会自己做事儿，而是会调用 Delegate 指定的某种 CNI 内置插件来完成。对于 Flannel 来说，它调用的 Delegate 插件，就是前面介绍到的 CNI bridge 插件。
+Delegate（委派） 字段的意思是，这个 CNI 插件并不会自己做事儿，而是会调用 Delegate 指定的某种 CNI 内置插件来完成。
+
+对于 Flannel 来说，它调用的 Delegate 插件，就是前面介绍到的 CNI bridge 插件。
 
 
 
@@ -6040,7 +6044,7 @@ Delegate 字段的意思是，这个 CNI 插件并不会自己做事儿，而是
 ```bash
 # 在宿主机上
 $ ip link add cni0 type bridge
-$ ip link set cni0 up
+$ ip link set cni0 up # 设置为启用状态
 ```
 
 接下来，CNI bridge 插件会通过 Infra 容器的 Network Namespace 文件，进入到这个 Network Namespace 里面，然后创建一对 Veth Pair 设备。
@@ -6056,7 +6060,7 @@ $ ip link add eth0 type veth peer name vethb4963f3
 # 启动eth0设备
 $ ip link set eth0 up 
 
-# 将Veth Pair设备的另一端（也就是vethb4963f3设备）放到宿主机（也就是Host Namespace）里
+# 将Veth Pair设备的另一端（也就是vethb4963f3设备）放到宿主机（也就是Host Namespace）里（通过设置netns实现）
 $ ip link set vethb4963f3 netns $HOST_NS
 
 # 通过Host Namespace，启动宿主机上的vethb4963f3设备
@@ -6080,9 +6084,9 @@ err := containerNS.Do(func(hostNS ns.NetNS) error {
 
 ```
 
+这个设计其实很容易理解。
 
-
-这个设计其实很容易理解。在编程时，容器的 Namespace 是可以直接通过 Namespace 文件拿到的；而 Host Namespace，则是一个隐含在上下文的参数。所以，像上面这样，先通过容器 Namespace 进入容器里面，然后再反向操作 Host Namespace，对于编程来说要更加方便。
+在编程时，容器的 Namespace 是可以直接通过 Namespace 文件拿到的；而 Host Namespace，则是一个隐含在上下文的参数。所以，像上面这样，先通过容器 Namespace 进入容器里面，然后再反向操作 Host Namespace，对于编程来说要更加方便。
 
 
 
@@ -6093,9 +6097,10 @@ err := containerNS.Do(func(hostNS ns.NetNS) error {
 $ ip link set vethb4963f3 master cni0
 ```
 
+> Hairpin Mode（发夹模式） 
+>
 
-
-在将 vethb4963f3 设备连接在 CNI 网桥之后，CNI bridge 插件还会为它设置 **Hairpin Mode（发夹模式）**。这是因为，在默认情况下，网桥设备是不允许一个数据包从一个端口进来后，再从这个端口发出去的。但是，它允许你为这个端口开启 Hairpin Mode，从而取消这个限制。
+在将 vethb4963f3 设备连接在 CNI 网桥之后，CNI bridge 插件还会为它设置 **Hairpin Mode（发夹模式）**。这是因为，**在默认情况下，网桥设备是不允许一个数据包从一个端口进来后，再从这个端口发出去的。但是，它允许你为这个端口开启 Hairpin Mode，从而取消这个限制**。
 
 
 
@@ -6109,13 +6114,11 @@ $ ip link set vethb4963f3 master cni0
 
 但如果你是在容器里面访问宿主机的 8080 端口，那么这个容器里发出的 IP 包会经过 vethb4963f3 设备（端口）和 docker0 网桥，来到宿主机上。此时，根据上述 DNAT 规则，这个 IP 包又需要回到 docker0 网桥，并且还是通过 vethb4963f3 端口进入到容器里。所以，这种情况下，我们就需要开启 vethb4963f3 端口的 Hairpin Mode 了。
 
-
-
 所以说，Flannel 插件要在 CNI 配置文件里声明 hairpinMode=true。这样，将来这个集群里的 Pod 才可以通过它自己的 Service 访问到自己。
 
 
 
-接下来，CNI bridge 插件会调用 CNI ipam 插件，从 ipam.subnet 字段规定的网段里为容器分配一个可用的 IP 地址。然后，CNI bridge 插件就会把这个 IP 地址添加在容器的 eth0 网卡上，同时为容器设置默认路由。这相当于在容器里执行：
+接下来，CNI bridge 插件会调用 CNI ipam（Address Management） 插件，从 ipam.subnet 字段规定的网段里为容器分配一个可用的 IP 地址。然后，CNI bridge 插件就会把这个 IP 地址添加在容器的 eth0 网卡上，同时为容器设置默认路由。这相当于在容器里执行：
 
 ```bash
 # 在容器里
@@ -6131,7 +6134,7 @@ $ ip route add default via 10.244.0.1 dev eth0
 $ ip addr add 10.244.0.1/24 dev cni0
 ```
 
-在执行完上述操作之后，CNI 插件会把容器的 IP 地址等信息返回给 dockershim，然后被 kubelet 添加到 Pod 的 Status 字段。
+在执行完上述操作之后，**CNI 插件会把容器的 IP 地址等信息返回给 dockershim，然后被 kubelet 添加到 Pod 的 Status 字段**。
 
 
 
@@ -6178,7 +6181,793 @@ Kubernetes 项目选择使用容器网络接口（Container Networking Interface
 
 
 
+### 补充
 
+#### ip 指令
+
+```json
+/# ip
+Usage: ip [ OPTIONS ] OBJECT { COMMAND | help }
+       ip [ -force ] -batch filename
+where  OBJECT := { address | addrlabel | amt | fou | help | ila | ioam | l2tp |
+                   link | macsec | maddress | monitor | mptcp | mroute | mrule |
+                   neighbor | neighbour | netconf | netns | nexthop | ntable |
+                   ntbl | route | rule | sr | tap | tcpmetrics |
+                   token | tunnel | tuntap | vrf | xfrm }
+       OPTIONS := { -V[ersion] | -s[tatistics] | -d[etails] | -r[esolve] |
+                    -h[uman-readable] | -iec | -j[son] | -p[retty] |
+                    -f[amily] { inet | inet6 | mpls | bridge | link } |
+                    -4 | -6 | -M | -B | -0 |
+                    -l[oops] { maximum-addr-flush-attempts } | -br[ief] |
+                    -o[neline] | -t[imestamp] | -ts[hort] | -b[atch] [filename] |
+                    -rc[vbuf] [size] | -n[etns] name | -N[umeric] | -a[ll] |
+                    -c[olor]}
+```
+
+object中的netns是跟network namespace网络隔离相关的指令。
+
+
+
+## 35 | 解读Kubernetes三层网络方案
+
+在上一篇文章中，作者以网桥类型的 Flannel 插件为例，为你讲解了 Kubernetes 里容器网络和 CNI 插件的主要工作原理。
+
+不过，除了这种模式之外，还有一种**纯三层（Pure Layer 3）网络方案**非常值得你注意。其中的典型例子，莫过于 **Flannel 的 host-gw 模式和 Calico 项目**了。
+
+### Flannel 的 host-gw 模式
+
+host-gw 示意图:
+
+<img src="深入剖析Kubernetes.assets/3d8b08411eeb49be2658eb4352206d25.png" alt="img" style="zoom: 33%;" />
+
+(通过配置路由iptables实现的？)
+
+假设现在，Node 1 上的 Infra-container-1，要访问 Node 2 上的 Infra-container-2。
+
+当你设置 Flannel 使用 host-gw 模式之后，flanneld 会在宿主机上创建这样一条规则，以 Node 1 为例：
+
+```bash
+$ ip route
+...
+10.244.1.0/24 via 10.168.0.3 dev eth0
+```
+
+这条路由规则的含义是：目的 IP 地址属于 10.244.1.0/24 网段的 IP 包，应该经过本机的 eth0 设备发出去（即：dev eth0）；并且，它**下一跳地址（next-hop）是 10.168.0.3（即：via 10.168.0.3）**。
+
+"via"是"virtual interface address"的缩写？
+
+所谓下一跳地址就是：如果 IP 包从主机 A 发到主机 B，需要经过路由设备 X 的中转。那么 X 的 IP 地址就应该配置为主机 A 的下一跳地址。
+
+而从 host-gw 示意图中我们可以看到，这个下一跳地址对应的，正是我们的目的宿主机 Node 2。
+
+一旦配置了下一跳地址，那么接下来，当 IP 包从网络层进入链路层封装成帧的时候，eth0 设备就会使用下一跳地址对应的 MAC 地址，作为该数据帧的目的 MAC 地址。显然，这个 MAC 地址，正是 Node 2 的 MAC 地址。
+
+这样，这个数据帧就会从 Node 1 通过宿主机的二层网络顺利到达 Node 2 上。
+
+
+
+而 Node 2 的内核网络栈从二层数据帧里拿到 IP 包后，会“看到”这个 IP 包的目的 IP 地址是 10.244.1.3，即 Infra-container-2 的 IP 地址。这时候，根据 Node 2 上的路由表，该目的地址会匹配到第二条路由规则（也就是 10.244.1.0 对应的路由规则），从而进入 cni0 网桥，进而进入到 Infra-container-2 当中。
+
+
+
+可以看到，**host-gw 模式的工作原理，其实就是将每个 Flannel 子网（Flannel Subnet，比如：10.244.1.0/24）的“下一跳”，设置成了该子网对应的宿主机的 IP 地址。**
+
+也就是说，**这台“主机”（Host）会充当这条容器通信路径里的“网关”（Gateway）。这也正是“host-gw”的含义**。
+
+
+
+当然，**Flannel 子网和主机的信息，都是保存在 Etcd 当中的**。flanneld 只需要 WACTH 这些数据的变化，然后实时更新路由表即可。
+
+> 注意：在 Kubernetes v1.7 之后，类似 Flannel、Calico 的 CNI 网络插件都是可以直接连接 Kubernetes 的 APIServer 来访问 Etcd 的，无需额外部署 Etcd 给它们使用。
+
+而在这种模式下，容器通信的过程就免除了额外的封包和解包带来的性能损耗。根据实际的测试，host-gw 的性能损失大约在 10% 左右，而其他所有基于 VXLAN“隧道”机制的网络方案，性能损失都在 20%~30% 左右。
+
+
+
+当然，通过上面的叙述，你也应该看到，host-gw 模式能够正常工作的核心，就在于 IP 包在封装成帧发送出去的时候，会使用路由表里的“下一跳”来设置目的 MAC 地址。这样，它就会经过二层网络到达目的宿主机。
+
+
+
+**所以说，Flannel host-gw 模式必须要求集群宿主机之间是二层连通的。**
+
+**需要注意的是，宿主机之间二层不连通的情况也是广泛存在的**。比如，宿主机分布在了不同的子网（VLAN）里。
+
+但是，在一个 Kubernetes 集群里，宿主机之间必须可以通过 IP 地址进行通信，也就是说至少是三层可达的。否则的话，你的集群将不满足上一篇文章中提到的宿主机之间 IP 互通的假设（Kubernetes 网络模型）。当然，“三层可达”也可以通过为几个子网设置三层转发来实现。
+
+
+
+### Calico 项目
+
+在容器生态中，要说到像 Flannel host-gw 这样的三层网络方案，我们就不得不提到这个领域里的“龙头老大”Calico 项目了。
+
+实际上，Calico 项目提供的网络解决方案，与 Flannel 的 host-gw 模式，几乎是完全一样的。也就是说，Calico 也会在每台宿主机上，添加一个格式如下所示的路由规则：
+
+```bash
+<目的容器IP地址段> via <网关的IP地址> dev eth0
+```
+
+其中，网关的 IP 地址，正是目的容器所在宿主机的 IP 地址。
+
+而正如前所述，这个三层网络方案得以正常工作的核心，是为每个容器的 IP 地址，找到它所对应的、“下一跳”的**网关**。
+
+
+
+#### BGP 边界网关协议
+
+不过，**不同于 Flannel 通过 Etcd 和宿主机上的 flanneld 来维护路由信息的做法，Calico 项目使用了一个“重型武器”来自动地在整个集群中分发路由信息。**
+
+这个“重型武器”，就是 BGP。
+
+**BGP 的全称是 Border Gateway Protocol，即：边界网关协议**。它是一个 Linux 内核原生就支持的、专门用在大规模数据中心里维护不同的“自治系统”之间路由信息的、无中心的路由协议。
+
+这个概念可能听起来有点儿“吓人”，但实际上可以用一个非常简单的例子来为你讲清楚。
+
+<img src="深入剖析Kubernetes.assets/2e4b3bee1d924f4ae25e2c1fd115379b.jpg" alt="img" style="zoom:50%;" />
+
+<center>图:自治系统</center>
+
+在这个图中，我们有两个**自治系统（Autonomous System，简称为 AS）**：AS 1 和 AS 2。而所谓的一个自治系统，指的是一个组织管辖下的所有 IP 网络和路由器的全体。你可以把它想象成一个小公司里的所有主机和路由器。在正常情况下，自治系统之间不会有任何“来往”。
+
+
+
+但是，如果这样两个自治系统里的主机，要通过 IP 地址直接进行通信，我们就必须使用路由器把这两个自治系统连接起来。
+
+比如，AS 1 里面的主机 10.10.0.2，要访问 AS 2 里面的主机 172.17.0.3 的话。它发出的 IP 包，就会先到达自治系统 AS 1 上的路由器 Router 1。
+
+而在此时，Router 1 的路由表里，有这样一条规则，即：目的地址是 172.17.0.2 包，应该经过 Router 1 的 C 接口，发往网关 Router 2（即：自治系统 AS 2 上的路由器）。
+
+所以 IP 包就会到达 Router 2 上，然后经过 Router 2 的路由表，从 B 接口出来到达目的主机 172.17.0.3。
+
+
+
+但是反过来，如果主机 172.17.0.3 要访问 10.10.0.2，那么这个 IP 包，在到达 Router 2 之后，就不知道该去哪儿了。因为在 Router 2 的路由表里，并没有关于 AS 1 自治系统的任何路由规则。
+
+所以这时候，网络管理员就应该给 Router 2 也添加一条路由规则，比如：目标地址是 10.10.0.2 的 IP 包，应该经过 Router 2 的 C 接口，发往网关 Router 1。
+
+像上面这样负责把自治系统连接在一起的路由器，我们就把它形象地称为：**边界网关**。**它跟普通路由器的不同之处在于，它的路由表里拥有其他自治系统里的主机路由信息**。
+
+
+
+但是，你可以想象一下，假设我们现在的**网络拓扑结构非常复杂**，每个自治系统都有成千上万个主机、无数个路由器，甚至是由多个公司、多个网络提供商、多个自治系统组成的复合自治系统呢？
+
+这时候，如果还要依靠人工来对边界网关的路由表进行配置和维护，那是绝对不现实的。
+
+而这种情况下，BGP 大显身手的时刻就到了。
+
+在使用了 BGP 之后，你可以认为，在每个边界网关上都会运行着一个小程序，它们会将各自的路由表信息，通过 TCP 传输给其他的边界网关。而其他边界网关上的这个小程序，则会对收到的这些数据进行分析，然后将需要的信息添加到自己的路由表里。
+
+
+
+这样，图 2 中 Router 2 的路由表里，就会自动出现 10.10.0.2 和 10.10.0.3 对应的路由规则了。
+
+所以说，**所谓 BGP，就是在大规模网络中实现节点路由信息共享的一种协议。**
+
+而 BGP 的这个能力，正好可以取代 Flannel 维护主机上路由表的功能。而且，BGP 这种原生就是为大规模网络环境而实现的协议，其可靠性和可扩展性，远非 Flannel 自己的方案可比。
+
+> 需要注意的是，BGP 协议实际上是最复杂的一种路由协议。我在这里的讲述和所举的例子，仅是为了能够帮助你建立对 BGP 的感性认识，并不代表 BGP 真正的实现方式。
+
+
+
+#### 项目介绍
+
+接下来，我们还是回到 Calico 项目上来。
+
+在了解了 BGP 之后，Calico 项目的架构就非常容易理解了。它由三个部分组成：
+
+1. Calico 的 CNI 插件。这是 Calico 与 Kubernetes 对接的部分。我已经在上一篇文章中，和你详细分享了 CNI 插件的工作原理，这里就不再赘述了。
+2. Felix。它是一个 DaemonSet，负责在宿主机上插入路由规则（即：写入 Linux 内核的 FIB 转发信息库），以及维护 Calico 所需的网络设备等工作。
+3. BIRD（Bird Internet Routing Daemon）。它就是 BGP 的客户端，专门负责在集群里分发路由规则信息。
+
+**除了对路由信息的维护方式之外，Calico 项目与 Flannel 的 host-gw 模式的另一个不同之处，就是它不会在宿主机上创建任何网桥设备**。这时候，Calico 的工作方式，可以用一幅示意图来描述，如下所示（在接下来的讲述中，我会统一用“BGP 示意图”来指代它）：
+
+
+
+<img src="深入剖析Kubernetes.assets/8db6dee96c4242738ae2878e58cecd1b.jpg" alt="img" style="zoom:50%;" />
+
+<center>Calico工作原理</center>
+
+其中的绿色实线标出的路径，就是一个 IP 包从 Node 1 上的 Container 1，到达 Node 2 上的 Container 4 的完整路径。
+
+可以看到，Calico 的 CNI 插件会为每个容器设置一个 Veth Pair 设备，然后把其中的一端放置在宿主机上（它的名字以 cali 前缀开头）。
+
+此外，由于 Calico 没有使用 CNI 的网桥模式，Calico 的 CNI 插件还需要在宿主机上为每个容器的 Veth Pair 设备配置一条路由规则，用于接收传入的 IP 包。比如，宿主机 Node 2 上的 Container 4 对应的路由规则，如下所示：
+
+```
+10.233.2.3 dev cali5863f3 scope link
+```
+
+即：发往 10.233.2.3 的 IP 包，应该进入 cali5863f3 设备。
+
+基于上述原因，Calico 项目在宿主机上设置的路由规则，肯定要比 Flannel 项目多得多。不过，Flannel host-gw 模式使用 CNI 网桥的主要原因，其实是为了跟 VXLAN 模式保持一致。否则的话，Flannel 就需要维护两套 CNI 插件了。
+
+有了这样的 Veth Pair 设备之后，容器发出的 IP 包就会经过 Veth Pair 设备出现在宿主机上。然后，宿主机网络栈就会根据路由规则的下一跳 IP 地址，把它们转发给正确的网关。接下来的流程就跟 Flannel host-gw 模式完全一致了。
+
+
+
+其中，这里**最核心的“下一跳”路由规则，就是由 Calico 的 Felix 进程负责维护的**。
+
+**这些路由规则信息，则是通过 BGP Client 也就是 BIRD 组件，使用 BGP 协议传输而来的**。
+
+
+
+而这些通过 BGP 协议传输的消息，你可以简单地理解为如下格式：
+
+```bash
+[BGP消息]
+我是宿主机192.168.1.3
+10.233.2.0/24网段的容器都在我这里
+这些容器的下一跳地址是我
+```
+
+
+
+不难发现，Calico 项目实际上将集群里的所有节点，都当作是边界路由器来处理，它们一起组成了一个全连通的网络，互相之间通过 BGP 协议交换路由规则。这些节点，我们称为 **BGP Peer**。
+
+
+
+需要注意的是，**Calico 维护的网络在默认配置下，是一个被称为“Node-to-Node Mesh”的模式**。这时候，每台宿主机上的 BGP Client 都需要跟其他所有节点的 BGP Client 进行通信以便交换路由信息。但是，随着节点数量 N 的增加，这些连接的数量就会以 N²的规模快速增长，从而给集群本身的网络带来巨大的压力。
+
+
+
+所以，Node-to-Node Mesh 模式一般推荐用在少于 100 个节点的集群里。而**在更大规模的集群中，你需要用到的是一个叫作 Route Reflector 的模式**。
+
+**在这种模式下，Calico 会指定一个或者几个专门的节点，来负责跟所有节点建立 BGP 连接从而学习到全局的路由规则**。而其他节点，只需要跟这几个专门的节点交换路由信息，就可以获得整个集群的路由规则信息了。
+
+这些专门的节点，就是所谓的 Route Reflector 节点，它们实际上扮演了“中间代理”的角色，从而把 BGP 连接的规模控制在 N 的数量级上。
+
+
+
+此外，我在前面提到过，Flannel host-gw 模式最主要的限制，就是**要求集群宿主机之间是二层连通的。而这个限制对于 Calico 来说，也同样存在**。
+
+举个例子，假如我们有两台处于不同子网的宿主机 Node 1 和 Node 2，对应的 IP 地址分别是 192.168.1.2 和 192.168.2.2。需要注意的是，这两台机器通过路由器实现了三层转发，所以这两个 IP 地址之间是可以相互通信的。
+
+但我们现在的需求，还是 Container 1 要访问 Container 4。
+
+按照我们前面的讲述，Calico 会尝试在 Node 1 上添加如下所示的一条路由规则：
+
+```
+10.233.2.0/16 via 192.168.2.2 eth0
+```
+
+但是，这时候问题就来了。
+
+上面这条规则里的下一跳地址是 192.168.2.2，可是它对应的 Node 2 跟 Node 1 却根本不在一个子网里，没办法通过二层网络把 IP 包发送到下一跳地址。
+
+
+
+**在这种情况下，你就需要为 Calico 打开 IPIP 模式。**
+
+这个模式下容器通信的原理如下所示（接下来称之为：IPIP 示意图）：
+
+<img src="深入剖析Kubernetes.assets/4dd9ad6415caf68da81562d9542049c9.jpg" alt="img" style="zoom:50%;" />
+
+<center>Calico IPIP工作原理</center>
+
+在 Calico 的 IPIP 模式下，Felix 进程在 Node 1 上添加的路由规则，会稍微不同，如下所示：
+
+```
+10.233.2.0/24 via 192.168.2.2 tunl0
+```
+
+可以看到，尽管这条规则的下一跳地址仍然是 Node 2 的 IP 地址，但这一次，要负责将 IP 包发出去的设备，变成了 **tunl0**。注意，是 T-U-N-L-0，而不是 Flannel UDP 模式使用的 T-U-N-0（tun0），这两种设备的功能是完全不一样的。
+
+Calico 使用的这个 tunl0 设备，是一个 **IP 隧道（IP tunnel）设备**。
+
+在上面的例子中，IP 包进入 IP 隧道设备之后，就会被 Linux 内核的 IPIP 驱动接管。IPIP 驱动会将这个 IP 包直接封装在一个宿主机网络的 IP 包中，如下所示：
+
+<img src="深入剖析Kubernetes.assets/fc2b4173782b7a993f4a43a2cb966f90.jpg" alt="img" style="zoom: 33%;" />
+
+<center>IPIP封包方式</center>
+
+其中，经过封装后的新的 IP 包的目的地址（图 5 中的 Outer IP Header 部分），正是原 IP 包的下一跳地址，即 Node 2 的 IP 地址：192.168.2.2。
+
+而原 IP 包本身，则会被直接封装成新 IP 包的 Payload。
+
+这样**原先从容器到 Node 2 的 IP 包，就被伪装成了一个从 Node 1 到 Node 2 的 IP 包**。
+
+
+
+由于宿主机之间已经使用路由器配置了三层转发，也就是设置了宿主机之间的“下一跳”。所以这个 IP 包在离开 Node 1 之后，就可以经过路由器，最终“跳”到 Node 2 上。
+
+这时，Node 2 的网络内核栈会使用 IPIP 驱动进行解包，从而拿到原始的 IP 包。然后，原始 IP 包就会经过路由规则和 Veth Pair 设备到达目的容器内部。
+
+以上，就是 Calico 项目主要的工作原理了。
+
+
+
+不难看到，当 Calico 使用 IPIP 模式的时候，集群的网络性能会因为额外的封包和解包工作而下降。在实际测试中，Calico IPIP 模式与 Flannel VXLAN 模式的性能大致相当。所以，在实际使用时，如非硬性需求，我建议你将所有宿主机节点放在一个子网里，避免使用 IPIP。
+
+
+
+不过，通过上面对 Calico 工作原理的讲述，你应该能发现这样一个事实：
+
+如果 Calico 项目能够让宿主机之间的路由设备（也就是网关），也通过 BGP 协议“学习”到 Calico 网络里的路由规则，那么从容器发出的 IP 包，不就可以通过这些设备路由到目的宿主机了么？
+
+比如，只要在上面“IPIP 示意图”中的 Node 1 上，添加如下所示的一条路由规则：
+
+```
+10.233.2.0/24 via 192.168.1.1 eth0
+```
+
+然后，在 Router 1 上（192.168.1.1），添加如下所示的一条路由规则：
+
+```
+10.233.2.0/24 via 192.168.2.1 eth0
+```
+
+那么 Container 1 发出的 IP 包，就可以通过两次“下一跳”，到达 Router 2（192.168.2.1）了。以此类推，我们可以继续在 Router 2 上添加“下一条”路由，最终把 IP 包转发到 Node 2 上。
+
+**遗憾的是，上述流程虽然简单明了，但是在 Kubernetes 被广泛使用的公有云场景里，却完全不可行。**
+
+**这里的原因在于：公有云环境下，宿主机之间的网关，肯定不会允许用户进行干预和设置**。
+
+> 当然，在大多数公有云环境下，宿主机（公有云提供的虚拟机）本身往往就是二层连通的，所以这个需求也不强烈。
+
+
+
+#### 两种BGP Peer设置方案
+
+不过，在私有部署的环境下，宿主机属于不同子网（VLAN）反而是更加常见的部署状态。这时候，想办法将宿主机网关也加入到 BGP Mesh 里从而避免使用 IPIP，就成了一个非常迫切的需求。
+
+
+
+而在 Calico 项目中，它已经为你提供了两种将宿主机网关设置成 BGP Peer 的解决方案。
+
+**第一种方案**，就是所有宿主机都跟宿主机网关建立 BGP Peer 关系。
+
+这种方案下，Node 1 和 Node 2 就需要主动跟宿主机网关 Router 1 和 Router 2 建立 BGP 连接。从而将类似于 10.233.2.0/24 这样的路由信息同步到网关上去。
+
+需要注意的是，这种方式下，**Calico 要求宿主机网关必须支持一种叫作 Dynamic Neighbors 的 BGP 配置方式**。这是因为，在常规的路由器 BGP 配置里，运维人员必须明确给出所有 BGP Peer 的 IP 地址。考虑到 Kubernetes 集群可能会有成百上千个宿主机，而且还会动态地添加和删除节点，这时候再手动管理路由器的 BGP 配置就非常麻烦了。而 Dynamic Neighbors 则允许你给路由器配置一个网段，然后路由器就会自动跟该网段里的主机建立起 BGP Peer 关系。
+
+
+
+不过，相比之下，更推荐**第二种方案**。
+
+这种方案，是使用一个或多个独立组件负责搜集整个集群里的所有路由信息，然后通过 BGP 协议同步给网关。而我们前面提到，在大规模集群中，Calico 本身就推荐使用 Route Reflector 节点的方式进行组网。所以，这里负责跟宿主机网关进行沟通的独立组件，直接由 Route Reflector 兼任即可。
+
+更重要的是，这种情况下网关的 BGP Peer 个数是有限并且固定的。所以我们就可以直接把这些独立组件配置成路由器的 BGP Peer，而无需 Dynamic Neighbors 的支持。
+
+
+
+当然，这些独立组件的工作原理也很简单：它们只需要 WATCH Etcd 里的宿主机和对应网段的变化信息，然后把这些信息通过 BGP 协议分发给网关即可。
+
+
+
+### 总结
+
+本篇文章详细讲述了 Fannel host-gw 模式和 Calico 这两种纯三层网络方案的工作原理。
+
+
+
+需要注意的是，在大规模集群里，三层网络方案在宿主机上的路由规则可能会非常多，这会导致错误排查变得困难。此外，在系统故障的时候，路由规则出现重叠冲突的概率也会变大。
+
+
+
+基于上述原因，如果是在公有云上，由于宿主机网络本身比较“直白”，一般会推荐更加简单的 Flannel host-gw 模式。
+
+但不难看到，在私有部署环境里，Calico 项目才能够覆盖更多的场景，并为你提供更加可靠的组网方案和架构思路。
+
+
+
+### 思考题
+
+你能否能总结一下三层网络方案和“隧道模式”的异同，以及各自的优缺点？
+
+> chatGPT的回答
+
+当谈到Kubernetes（k8s）中的三层网络方案和隧道模式时，通常是指容器网络的实现方式。下面是它们的异同以及各自的优缺点：
+
+三层网络方案：
+
+- 异同：三层网络方案使用物理网络的三层（网络层）功能来实现容器之间的通信。它使用主机上的物理网络设备和路由器来处理容器之间的数据包转发。
+- 优点：三层网络方案具有较低的延迟和较高的性能，因为它直接利用物理网络设备进行数据包转发。它也可以与现有的网络基础设施集成，无需额外的网络隧道。
+- 缺点：三层网络方案需要在物理网络设备上进行配置和管理，可能需要更多的网络知识和操作。它对网络基础设施的依赖性较高，可能需要进行更多的配置和调整。
+
+隧道模式：
+
+- 异同：隧道模式使用虚拟网络隧道来封装和传输容器之间的数据包。它在底层网络之上创建了一个逻辑网络，容器之间的通信通过隧道进行。
+- 优点：隧道模式提供了更大的灵活性，可以在不同的网络环境中使用，无需对底层网络进行特殊配置。它可以在不同的主机之间创建虚拟网络，实现容器之间的通信。
+- 缺点：隧道模式可能会引入一定的延迟和性能损失，因为数据包需要经过额外的封装和解封装过程。它也可能需要更多的网络资源，如带宽和计算资源，来处理隧道数据包。
+
+总结： 三层网络方案和隧道模式都是在Kubernetes中实现容器网络的方法。三层网络方案具有较低的延迟和较高的性能，但需要更多的网络配置和管理。隧道模式提供了更大的灵活性，但可能引入一定的延迟和性能损失。选择哪种方案取决于具体的网络需求和环境，以及对性能和管理复杂性的权衡。
+
+
+
+## 36 | 为什么说Kubernetes只有soft multi-tenancy（多租户）？
+
+不难发现，Kubernetes 的网络模型，以及前面这些网络方案的实现，都只关注容器之间网络的“连通”，却并不关心容器之间网络的“隔离”。这跟传统的 IaaS 层的网络方案，区别非常明显。
+
+你肯定会问了，Kubernetes 的网络方案对“隔离”到底是如何考虑的呢？难道 Kubernetes 就不管网络“多租户”的需求吗？
+
+
+
+###  NetworkPolicy  实现网络隔离
+
+**在 Kubernetes 里，网络隔离能力的定义，是依靠一种专门的 API 对象来描述的，即：NetworkPolicy（网络策略）**。
+
+一个完整的 NetworkPolicy 对象的示例，如下所示：
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: test-network-policy
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      role: db
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - ipBlock:
+        cidr: 172.17.0.0/16
+        except:
+        - 172.17.1.0/24
+    - namespaceSelector:
+        matchLabels:
+          project: myproject
+    - podSelector:
+        matchLabels:
+          role: frontend
+    ports:
+    - protocol: TCP
+      port: 6379
+  egress:
+  - to:
+    - ipBlock:
+        cidr: 10.0.0.0/24
+    ports:
+    - protocol: TCP
+      port: 5978
+
+```
+
+**Kubernetes 里的 Pod 默认都是“允许所有”（Accept All）的**，即：Pod 可以接收来自任何发送方的请求；或者，向任何接收方发送请求。而如果你要对这个情况作出限制，就必须通过 NetworkPolicy 对象来指定。
+
+而在上面这个例子里，你首先会看到 podSelector 字段。它的作用，就是定义这个 NetworkPolicy 的限制范围，比如：当前 Namespace 里携带了 role=db 标签的 Pod。
+
+而如果你把 podSelector 字段留空：
+
+```yaml
+spec:
+ podSelector: {}
+```
+
+那么这个 NetworkPolicy 就会作用于当前 Namespace 下的所有 Pod。
+
+
+
+而一旦 Pod 被 NetworkPolicy 选中，**那么这个 Pod 就会进入“拒绝所有”（Deny All）的状态**，即：这个 Pod 既不允许被外界访问，也不允许对外界发起访问。
+
+**而 NetworkPolicy 定义的规则，其实就是“白名单”。**
+
+例如，在我们上面这个例子里，我在 policyTypes 字段，定义了这个 **NetworkPolicy** 的类型是 ingress 和 egress，即：它既会影响流入（ingress）请求，也会影响流出（egress）请求。
+
+
+
+然后，在 **ingress 字段**里，我定义了 from 和 ports，即：允许流入的“白名单”和端口。其中，这个允许流入的“白名单”里，例子中指定了**三种并列的情况**，分别是：ipBlock、namespaceSelector 和 podSelector。
+
+而在 egress 字段里，例子则定义了 to 和 ports，即：允许流出的“白名单”和端口。这里允许流出的“白名单”的定义方法与 ingress 类似。只不过，这一次 ipblock 字段指定的，是目的地址的网段。
+
+
+
+综上所述，这个 NetworkPolicy 对象，指定的隔离规则如下所示：
+
+1. 该隔离规则只对 default Namespace 下的，携带了 role=db 标签的 Pod 有效。限制的请求类型包括 ingress（流入）和 egress（流出）。
+
+2. Kubernetes 会拒绝任何访问被隔离 Pod 的请求，除非这个请求来自于以下“白名单”里的对象，并且访问的是被隔离 Pod 的 6379 端口。这些“白名单”对象包括：
+
+   a. default Namespace 里的，携带了 role=fronted 标签的 Pod；
+
+   b. 携带了 project=myproject 标签的 Namespace 里的任何 Pod；
+
+   c. 任何源地址属于 172.17.0.0/16 网段，且不属于 172.17.1.0/24 网段的请求。
+
+3. Kubernetes 会拒绝被隔离 Pod 对外发起任何请求，除非请求的目的地址属于 10.0.0.0/24 网段，并且访问的是该网段地址的 5978 端口。
+
+
+
+需要注意的是，定义一个 NetworkPolicy 对象的过程，容易犯错的是“白名单”部分（from 和 to 字段）。
+
+举个例子：
+
+```
+  ...
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          user: alice
+    - podSelector:
+        matchLabels:
+          role: client
+  ...
+
+```
+
+像上面这样定义的 namespaceSelector 和 podSelector，是“或”（OR）的关系。所以说，这个 from 字段定义了两种情况，无论是 Namespace 满足条件，还是 Pod 满足条件，这个 NetworkPolicy 都会生效。
+
+而下面这个例子，虽然看起来类似，但是它定义的规则却完全不同：
+
+```yaml
+...
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          user: alice
+      podSelector:
+        matchLabels:
+          role: client
+  ...
+
+```
+
+注意看，这样定义的 namespaceSelector 和 podSelector，其实是“与”（AND）的关系。所以说，这个 from 字段只定义了一种情况，只有 Namespace 和 Pod 同时满足条件，这个 NetworkPolicy 才会生效。
+
+**这两种定义方式的区别，请你一定要分清楚。**
+
+
+
+此外，如果要使上面定义的 NetworkPolicy 在 Kubernetes 集群里真正产生作用，你的 CNI 网络插件就必须是支持 Kubernetes 的 NetworkPolicy 的。
+
+在具体实现上，凡是支持 NetworkPolicy 的 CNI 网络插件，都维护着一个 NetworkPolicy Controller，通过控制循环的方式对 NetworkPolicy 对象的增删改查做出响应，然后在宿主机上完成 iptables 规则的配置工作。
+
+**在 Kubernetes 生态里，目前已经实现了 NetworkPolicy 的网络插件包括 Calico、Weave 和 kube-router 等多个项目，但是==并不包括 Flannel 项目==。**
+
+
+
+所以说，如果想要在使用 Flannel 的同时还使用 NetworkPolicy 的话，你就需要再额外安装一个网络插件，比如 Calico 项目，来负责执行 NetworkPolicy。
+
+> 安装 Flannel + Calico 的流程非常简单，你直接参考这个文档[一键安装](https://docs.projectcalico.org/v3.2/getting-started/kubernetes/installation/flannel)即可。
+
+
+
+### 隔离的原理
+
+> 根据NetworkPolicy生成iptables规则
+
+那么，这些网络插件，又是如何根据 NetworkPolicy 对 Pod 进行隔离的呢？
+
+接下来，我就以三层网络插件为例（比如 Calico 和 kube-router），来为你分析一下这部分的原理。
+
+为了方便讲解，这一次编写了一个比较简单的 NetworkPolicy 对象，如下所示：
+
+```yaml
+apiVersion: extensions/v1beta1
+kind: NetworkPolicy
+metadata:
+  name: test-network-policy
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      role: db
+  ingress:
+   - from:
+     - namespaceSelector:
+         matchLabels:
+           project: myproject
+     - podSelector:
+         matchLabels:
+           role: frontend
+     ports:
+       - protocol: tcp
+         port: 6379
+
+```
+
+可以看到，我们指定的 ingress“白名单”，是任何 Namespace 里，携带 project=myproject 标签的 Namespace 里的 Pod；或者 default Namespace 里，携带了 role=frontend 标签的 Pod。允许被访问的端口是：6379。
+
+而被隔离的对象，是所有携带了 role=db 标签的 Pod。
+
+
+
+那么这个时候，**Kubernetes 的网络插件就会使用这个 NetworkPolicy 的定义，在宿主机上生成 iptables 规则**。这个过程，我可以通过如下所示的一段 Go 语言风格的伪代码来为你描述：
+
+```bash
+for dstIP := range 所有被networkpolicy.spec.podSelector选中的Pod的IP地址
+  for srcIP := range 所有被ingress.from.podSelector选中的Pod的IP地址
+    for port, protocol := range ingress.ports {
+      iptables -A KUBE-NWPLCY-CHAIN -s $srcIP -d $dstIP -p $protocol -m $protocol --dport $port -j ACCEPT 
+    }
+  }
+} 
+```
+
+可以看到，这是一条最基本的、通过匹配条件决定下一步动作的 iptables 规则。
+
+这条规则的名字是 KUBE-NWPLCY-CHAIN，含义是：当 IP 包的源地址是 srcIP、目的地址是 dstIP、协议是 protocol、目的端口是 port 的时候，就允许它通过（ACCEPT）。
+
+
+
+而正如这段伪代码所示，匹配这条规则所需的这四个参数，都是从 NetworkPolicy 对象里读取出来的。
+
+**可以看到，Kubernetes 网络插件对 Pod 进行隔离，其实是靠在宿主机上生成 NetworkPolicy 对应的 iptable 规则来实现的。**
+
+
+
+此外，在设置好上述“隔离”规则之后，网络插件还需要想办法，将所有对被隔离 Pod 的访问请求，都转发到上述 KUBE-NWPLCY-CHAIN 规则上去进行匹配。**并且，如果匹配不通过，这个请求应该被“拒绝”**。
+
+
+
+在 CNI 网络插件中，上述需求可以通过设置两组 iptables 规则来实现。
+
+**第一组规则，负责“拦截”对被隔离 Pod 的访问请求**。生成这一组规则的伪代码，如下所示：
+
+```bash
+for pod := range 该Node上的所有Pod {
+    if pod是networkpolicy.spec.podSelector选中的 {
+        iptables -A FORWARD -d $podIP -m physdev --physdev-is-bridged -j KUBE-POD-SPECIFIC-FW-CHAIN
+        iptables -A FORWARD -d $podIP -j KUBE-POD-SPECIFIC-FW-CHAIN
+        ...
+    }
+}
+```
+
+可以看到，这里的的 iptables 规则使用到了内置链：FORWARD。它是什么意思呢？
+
+说到这里，我就得为你稍微普及一下 iptables 的知识了。
+
+在理解了 iptables 的工作原理之后，我们再回到 NetworkPolicy 上来。这时候，前面由网络插件设置的、负责“拦截”进入 Pod 的请求的三条 iptables 规则，就很容易读懂了：
+
+```bash
+iptables -A FORWARD -d $podIP -m physdev --physdev-is-bridged -j KUBE-POD-SPECIFIC-FW-CHAIN
+iptables -A FORWARD -d $podIP -j KUBE-POD-SPECIFIC-FW-CHAIN
+...
+
+```
+
+其中，**第一条 FORWARD 链“拦截”的是一种特殊情况**：它对应的是同一台宿主机上容器之间经过 CNI 网桥进行通信的流入数据包。其中，--physdev-is-bridged 的意思就是，这个 FORWARD 链匹配的是，通过本机上的网桥设备，发往目的地址是 podIP 的 IP 包。
+
+当然，如果是像 Calico 这样的非网桥模式的 CNI 插件，就不存在这个情况了。
+
+> kube-router 其实是一个简化版的 Calico，它也使用 BGP 来维护路由信息，但是使用 CNI bridge 插件负责跟 Kubernetes 进行交互。
+
+
+
+而**第二条 FORWARD 链“拦截”的则是最普遍的情况，即：容器跨主通信**。这时候，流入容器的数据包都是经过路由转发（FORWARD 检查点）来的。
+
+不难看到，这些规则最后都跳转（即：-j）到了名叫 KUBE-POD-SPECIFIC-FW-CHAIN 的规则上。它正是网络插件为 NetworkPolicy 设置的第二组规则。
+
+而这个 KUBE-POD-SPECIFIC-FW-CHAIN 的作用，就是做出“允许”或者“拒绝”的判断。这部分功能的实现，可以简单描述为下面这样的 iptables 规则：
+
+```bash
+iptables -A KUBE-POD-SPECIFIC-FW-CHAIN -j KUBE-NWPLCY-CHAIN
+iptables -A KUBE-POD-SPECIFIC-FW-CHAIN -j REJECT --reject-with icmp-port-unreachable
+```
+
+可以看到，首先在第一条规则里，我们会把 IP 包转交给前面定义的 KUBE-NWPLCY-CHAIN 规则去进行匹配。按照我们之前的讲述，如果匹配成功，那么 IP 包就会被“允许通过”。
+
+
+
+而如果匹配失败，IP 包就会来到第二条规则上。可以看到，它是一条 REJECT 规则。通过这条规则，不满足 NetworkPolicy 定义的请求就会被拒绝掉，从而实现了对该容器的“隔离”。
+
+
+
+以上，就是 CNI 网络插件实现 NetworkPolicy 的基本方法了。当然，对于不同的插件来说，上述实现过程可能有不同的手段，但根本原理是不变的。
+
+### 总结
+
+本篇文章主要分享了 Kubernetes 对 Pod 进行“隔离”的手段，即：NetworkPolicy。
+
+可以看到，NetworkPolicy 实际上只是宿主机上的一系列 iptables 规则。这跟传统 IaaS 里面的**安全组（Security Group）**其实是非常类似的。
+
+而基于上述讲述，你就会发现这样一个事实：
+
+
+
+Kubernetes 的网络模型以及大多数容器网络实现，其实既不会保证容器之间二层网络的互通，也不会实现容器之间的二层网络隔离。这跟 IaaS 项目管理虚拟机的方式，是完全不同的。
+
+所以说，Kubernetes 从底层的设计和实现上，更倾向于假设你已经有了一套完整的物理基础设施。然后，Kubernetes 负责在此基础上提供一种“弱多租户”（soft multi-tenancy）的能力。
+
+
+
+并且，基于上述思路，Kubernetes 将来也不大可能把 Namespace 变成一个具有实质意义的隔离机制，或者把它映射成为“子网”或者“租户”。毕竟你可以看到，NetworkPolicy 对象的描述能力，要比基于 Namespace 的划分丰富得多。
+
+
+
+这也是为什么，**到目前为止，Kubernetes 项目在云计算生态里的定位，其实是基础设施与 PaaS 之间的中间层。**这是非常符合“容器”这个本质上就是进程的抽象粒度的。
+
+当然，随着 Kubernetes 社区以及 CNCF 生态的不断发展，Kubernetes 项目也已经开始逐步下探，“吃”掉了基础设施领域的很多“蛋糕”。这也正是容器生态继续发展的一个必然方向。
+
+### 思考题
+
+请你编写这样一个 NetworkPolicy：它使得指定的 Namespace（比如 my-namespace）里的所有 Pod，都不能接收任何 Ingress 请求。然后，请你说说，这样的 NetworkPolicy 有什么实际的作用？
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-ingress
+  namespace: my-namespace
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  ingress: []
+```
+
+> chatGPT回答
+
+这样的NetworkPolicy在实际中可以用于增强Kubernetes集群的安全性和网络隔离。以下是它的一些实际作用：
+
+1. 阻止未经授权的访问：通过禁止指定Namespace中的所有Pod接收任何Ingress请求，可以确保只有经过授权的请求才能到达这些Pod。这有助于防止未经授权的访问和潜在的安全漏洞。
+2. 网络隔离：通过限制Ingress请求，可以实现Namespace级别的网络隔离。这意味着只有在同一Namespace中的Pod才能相互通信，而来自其他Namespace的Pod将无法直接访问这些Pod。这提供了一定程度的隔离和安全性，可以防止跨Namespace的攻击和干扰。
+3. 细粒度的访问控制：通过NetworkPolicy，可以根据需要定义更复杂的规则，例如允许特定的IP地址或标签选择器访问Pod。这样可以实现更细粒度的访问控制，确保只有符合规则的请求才能到达Pod。
+4. 遵循安全最佳实践：禁止Ingress请求是一种常见的安全最佳实践，特别是对于一些敏感的应用或数据。通过应用这样的NetworkPolicy，可以确保只有Pod主动发起的请求才能通过Egress流量离开，从而减少潜在的攻击面。
+
+总之，这样的NetworkPolicy可以提供一定程度的安全性和网络隔离，确保只有经过授权的请求才能到达指定Namespace中的Pod。
+
+
+
+### 补充
+
+####  iptables 
+
+说到这里，我就得为你稍微普及一下 iptables 的知识了。
+
+实际上，iptables 只是一个操作 Linux 内核 Netfilter 子系统的“界面”。顾名思义，Netfilter 子系统的作用，就是 Linux 内核里挡在“网卡”和“用户态进程”之间的一道“防火墙”。它们的关系，可以用如下的示意图来表示：
+
+<img src="深入剖析Kubernetes.assets/4a012412dd694cb815ac9ee11ce511c2.png" alt="img" style="zoom:50%;" />
+
+可以看到，这幅示意图中，IP 包“一进一出”的两条路径上，有几个关键的“检查点”，它们正是 Netfilter 设置“防火墙”的地方。**在 iptables 中，这些“检查点”被称为：链（Chain）**。这是因为这些“检查点”对应的 iptables 规则，是按照定义顺序依次进行匹配的。这些“检查点”的具体工作原理，可以用如下所示的示意图进行描述：
+
+<img src="深入剖析Kubernetes.assets/f722f0f8b16338b02aa02904729dbc8e.jpg" alt="img" style="zoom:50%;" />
+
+可以看到，当一个 IP 包通过网卡进入主机之后，它就进入了 Netfilter 定义的流入路径（Input Path）里。
+
+
+
+在这个路径中，IP 包要经过路由表路由来决定下一步的去向。而在这次路由之前，Netfilter 设置了一个名叫 PREROUTING 的“检查点”。**在 Linux 内核的实现里，所谓“检查点”实际上就是内核网络协议栈代码里的 Hook**（比如，在执行路由判断的代码之前，内核会先调用 PREROUTING 的 Hook）。
+
+而在经过路由之后，IP 包的去向就分为了两种：
+
+- 第一种，继续在本机处理；
+- 第二种，被转发到其他目的地。
+
+**我们先说一下 IP 包的第一种去向**。这时候，IP 包将继续向上层协议栈流动。在它进入传输层之前，Netfilter 会设置一个名叫 INPUT 的“检查点”。到这里，IP 包流入路径（Input Path）结束。
+
+
+
+接下来，这个 IP 包通过传输层进入用户空间，交给用户进程处理。而处理完成后，用户进程会通过本机发出返回的 IP 包。这时候，这个 IP 包就进入了流出路径（**Output Path**）。
+
+此时，IP 包首先还是会经过主机的路由表进行路由。路由结束后，Netfilter 就会设置一个名叫 OUTPUT 的“检查点”。然后，在 OUTPUT 之后，再设置一个名叫 POSTROUTING“检查点”。
+
+
+
+你可能会觉得奇怪，为什么在流出路径结束后，Netfilter 会连着设置两个“检查点”呢？
+
+这就要说到在流入路径里，**路由判断后的第二种去向**了。
+
+在这种情况下，这个 IP 包不会进入传输层，而是会继续在网络层流动，从而进入到转发路径（Forward Path）。在转发路径中，Netfilter 会设置一个名叫 FORWARD 的“检查点”。
+
+
+
+而在 FORWARD“检查点”完成后，IP 包就会来到流出路径。而转发的 IP 包由于目的地已经确定，它就不会再经过路由，也自然不会经过 OUTPUT，而是会直接来到 POSTROUTING“检查点”。
+
+所以说，**POSTROUTING 的作用，其实就是上述两条路径，最终汇聚在一起的“最终检查点”**。
+
+需要注意的是，在有网桥参与的情况下，上述 Netfilter 设置“检查点”的流程，实际上也会出现在链路层（二层），并且会跟我在上面讲述的网络层（三层）的流程有交互。
+
+
+
+这些链路层的“检查点”对应的操作界面叫作 ebtables。所以，准确地说，数据包在 Linux Netfilter 子系统里完整的流动过程，其实应该如下所示（这是一幅来自[Netfilter 官方的原理图](https://en.wikipedia.org/wiki/Iptables#/media/File:Netfilter-packet-flow.svg)，建议你点击图片以查看大图）：
+
+<img src="深入剖析Kubernetes.assets/e96b58808bf16039e9975e947a6c7532.jpg" alt="img" style="zoom:80%;" />
+
+可以看到，前面为你讲述的，正是上图中绿色部分，也就是网络层的 iptables 链的工作流程。
+
+
+
+另外，你应该还能看到，每一个白色的“检查点”上，还有一个绿色的“标签”，比如：raw、nat、filter 等等。
+
+**在 iptables 里，这些标签叫作：表**。比如，同样是 OUTPUT 这个“检查点”，filter Output 和 nat Output 在 iptables 里的语法和参数，就完全不一样，实现的功能也完全不同。
+
+所以说，iptables 表的作用，就是在某个具体的“检查点”（比如 Output）上，按顺序执行几个不同的检查动作（比如，先执行 nat，再执行 filter）。
 
 
 
