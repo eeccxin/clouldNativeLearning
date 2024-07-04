@@ -7690,21 +7690,665 @@ UP BROADCAST RUNNING PROMISC MULTICAST  MTU:1460  Metric:1
 
 为什么 Kubernetes 要求 externalIPs 必须是至少能够路由到一个 Kubernetes 的节点？
 
+> chatGPT
 
+Kubernetes要求`externalIPs`必须是至少能够路由到一个Kubernetes节点的原因是为了**确保外部流量能够正确地路由到相应的服务**。
 
+当您在Kubernetes中创建一个Service并指定`externalIPs`时，这意味着您希望将该Service公开到集群外部。为了实现这一点，Kubernetes需要确保外部流量能够到达集群中的某个节点，并正确地路由到相应的Service。
 
+如果`externalIPs`无法路由到任何Kubernetes节点，那么外部流量将无法到达集群中的Service。这可能是由于网络配置、防火墙规则或路由设置等原因导致的。
 
-
+通过要求`externalIPs`至少能够路由到一个Kubernetes节点，Kubernetes确保了外部流量能够正确地到达集群中的Service，并通过Kubernetes的负载均衡和服务发现机制将流量路由到相应的Pod。
 
 
 
 ## 39 | 谈谈Service与Ingress
+
+上一篇文章详细讲解了将 Service 暴露给外界的三种方法。其中有一个叫作 LoadBalancer 类型的 Service，它会为你在 Cloud Provider（比如：Google Cloud 或者 OpenStack）里创建一个与该 Service 对应的负载均衡服务。
+
+但是，相信你也应该能感受到，由于每个 Service 都要有一个负载均衡服务，所以这个做法实际上既浪费成本又高。作为用户，我其实更希望看到 Kubernetes 为我内置一个全局的负载均衡器。然后，通过我访问的 URL，把请求转发给不同的后端 Service。
+
+**这种全局的、为了代理不同后端 Service 而设置的负载均衡服务，就是 Kubernetes 里的 Ingress 服务。**
+
+所以，Ingress 的功能其实很容易理解：**所谓 Ingress，就是 Service 的“Service”。**
+
+
+
+### Ingress 反向代理
+
+举个例子，假如我现在有这样一个站点：`https://cafe.example.com`。其中，`https://cafe.example.com/coffee`，对应的是“咖啡点餐系统”。而，`https://cafe.example.com/tea`，对应的则是“茶水点餐系统”。这两个系统，分别由名叫 coffee 和 tea 这样两个 Deployment 来提供服务。
+
+那么现在，我如何能使用 Kubernetes 的 Ingress 来创建一个统一的负载均衡器，从而实现当用户访问不同的域名时，能够访问到不同的 Deployment 呢？
+
+上述功能，在 Kubernetes 里就需要通过 Ingress 对象来描述，如下所示：
+
+```yaml
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: cafe-ingress
+spec:
+  tls:
+  - hosts:
+    - cafe.example.com
+    secretName: cafe-secret
+  rules:
+  - host: cafe.example.com
+    http:
+      paths:
+      - path: /tea
+        backend:
+          serviceName: tea-svc
+          servicePort: 80
+      - path: /coffee
+        backend:
+          serviceName: coffee-svc
+          servicePort: 80
+```
+
+指定域名path的后端svc。（有点像nigix的路由反向代理）
+
+在上面这个名叫 cafe-ingress.yaml 文件中，最值得我们关注的，是 rules 字段。在 Kubernetes 里，这个字段叫作：**IngressRule**。
+
+IngressRule 的 Key，就叫做：host。它必须是一个标准的域名格式（Fully Qualified Domain Name）的字符串，而不能是 IP 地址。
+
+> 备注：Fully Qualified Domain Name 的具体格式，可以参考[RFC 3986](https://tools.ietf.org/html/rfc3986)标准。
+
+而 host 字段定义的值，就是这个 Ingress 的入口。这也就意味着，当用户访问 cafe.example.com 的时候，实际上访问到的是这个 Ingress 对象。这样，Kubernetes 就能使用 IngressRule 来对你的请求进行下一步转发。
+
+而接下来 IngressRule 规则的定义，则依赖于 path 字段。你可以简单地理解为，这里的每一个 path 都对应一个后端 Service。所以在我们的例子里，我定义了两个 path，它们分别对应 coffee 和 tea 这两个 Deployment 的 Service（即：coffee-svc 和 tea-svc）。
+
+
+
+**通过上面的讲解，不难看到，所谓 Ingress 对象，其实就是 Kubernetes 项目对“反向代理”的一种抽象。**
+
+一个 Ingress 对象的主要内容，实际上就是一个“反向代理”服务（比如：Nginx）的配置文件的描述。而这个代理服务对应的转发规则，就是 IngressRule。
+
+这就是为什么在每条 IngressRule 里，需要有一个 host 字段来作为这条 IngressRule 的入口，然后还需要有一系列 path 字段来声明具体的转发策略。这其实跟 Nginx、HAproxy 等项目的配置文件的写法是一致的。
+
+而有了 Ingress 这样一个统一的抽象，Kubernetes 的用户就无需关心 Ingress 的具体细节了。
+
+在实际的使用中，你只需要**从社区里选择一个具体的 Ingress Controller**，把它部署在 Kubernetes 集群里即可。
+
+
+
+然后，这个 Ingress Controller 会根据你定义的 Ingress 对象，提供对应的代理能力。目前，业界常用的各种反向代理项目，比如 Nginx、HAProxy、Envoy、Traefik 等，都已经为 Kubernetes 专门维护了对应的 Ingress Controller。
+
+
+
+### Nginx Ingress Controller 例子
+
+接下来，我就以最常用的 Nginx Ingress Controller 为例，在我们前面用 kubeadm 部署的 Bare-metal 环境中，和你实践一下 Ingress 机制的使用过程。
+
+部署 Nginx Ingress Controller 的方法非常简单，如下所示：
+
+```
+$ kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/master/deploy/mandatory.yaml
+```
+
+其中，在[mandatory.yaml](https://raw.githubusercontent.com/kubernetes/ingress-nginx/master/deploy/mandatory.yaml)这个文件里（404了），正是 Nginx 官方为你维护的 Ingress Controller 的定义。我们来看一下它的内容：
+
+```yaml
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: nginx-configuration
+  namespace: ingress-nginx
+  labels:
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/part-of: ingress-nginx
+---
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: nginx-ingress-controller
+  namespace: ingress-nginx
+  labels:
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/part-of: ingress-nginx
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ingress-nginx
+      app.kubernetes.io/part-of: ingress-nginx
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ingress-nginx
+        app.kubernetes.io/part-of: ingress-nginx
+      annotations:
+        ...
+    spec:
+      serviceAccountName: nginx-ingress-serviceaccount
+      containers:
+        - name: nginx-ingress-controller
+          image: quay.io/kubernetes-ingress-controller/nginx-ingress-controller:0.20.0
+          args:
+            - /nginx-ingress-controller
+            - --configmap=$(POD_NAMESPACE)/nginx-configuration
+            - --publish-service=$(POD_NAMESPACE)/ingress-nginx
+            - --annotations-prefix=nginx.ingress.kubernetes.io
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - NET_BIND_SERVICE
+            # www-data -> 33
+            runAsUser: 33
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+            - name: http
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: http
+              containerPort: 80
+            - name: https
+              containerPort: 443
+
+```
+
+
+
+可以看到，在上述 YAML 文件中，我们定义了一个使用 nginx-ingress-controller 镜像的 Pod。需要注意的是，这个 Pod 的启动命令需要使用该 Pod 所在的 Namespace 作为参数。而这个信息，当然是通过 Downward API 拿到的，即：Pod 的 env 字段里的定义（env.valueFrom.fieldRef.fieldPath）。
+
+（`POD_NAMESPACE`：这个环境变量没有指定`valueFrom`字段，因此它的值将直接从Deployment所在的命名空间中获取。Kubernetes会自动将当前命名空间的名称作为`POD_NAMESPACE`的值。）
+
+
+
+而**这个 Pod 本身，就是一个监听 Ingress 对象以及它所代理的后端 Service 变化的控制器**。
+
+> 原理
+
+当一个新的 Ingress 对象由用户创建后，nginx-ingress-controller 就会根据 Ingress 对象里定义的内容，生成一份对应的 Nginx 配置文件（/etc/nginx/nginx.conf），并使用这个配置文件启动一个 Nginx 服务。
+
+而一旦 Ingress 对象被更新，nginx-ingress-controller 就会更新这个配置文件。需要注意的是，如果这里只是被代理的 Service 对象被更新，nginx-ingress-controller 所管理的 Nginx 服务是不需要重新加载（reload）的。这当然是因为 nginx-ingress-controller 通过[Nginx Lua](https://github.com/openresty/lua-nginx-module)方案实现了 Nginx Upstream 的动态配置。
+
+此外，nginx-ingress-controller 还允许你通过 Kubernetes 的 ConfigMap 对象来对上述 Nginx 配置文件进行定制。这个 ConfigMap 的名字，需要以参数的方式传递给 nginx-ingress-controller。而你在这个 ConfigMap 里添加的字段，将会被合并到最后生成的 Nginx 配置文件当中。
+
+**可以看到，一个 Nginx Ingress Controller 为你提供的服务，其实是一个可以根据 Ingress 对象和被代理后端 Service 的变化，来自动进行更新的 Nginx 负载均衡器。**
+
+
+
+当然，为了让用户能够用到这个 Nginx，我们就需要创建一个 Service 来把 Nginx Ingress Controller 管理的 Nginx 服务暴露出去，如下所示：
+
+```
+$ kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/master/deploy/provider/baremetal/service-nodeport.yaml
+```
+
+
+
+由于我们使用的是 Bare-metal 环境，所以 service-nodeport.yaml 文件里的内容，就是一个 NodePort 类型的 Service，如下所示：
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingress-nginx
+  namespace: ingress-nginx
+  labels:
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/part-of: ingress-nginx
+spec:
+  type: NodePort
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      protocol: TCP
+    - name: https
+      port: 443
+      targetPort: 443
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/part-of: ingress-nginx
+```
+
+可以看到，这个 Service 的唯一工作，就是将所有携带 ingress-nginx 标签的 Pod 的 80 和 433 端口暴露出去。
+
+> 而如果你是公有云上的环境，你需要创建的就是 LoadBalancer 类型的 Service 了。
+
+**上述操作完成后，你一定要记录下这个 Service 的访问入口，即：宿主机的地址和 NodePort 的端口**，如下所示：
+
+```
+$ kubectl get svc -n ingress-nginx
+NAME            TYPE       CLUSTER-IP     EXTERNAL-IP   PORT(S)                      AGE
+ingress-nginx   NodePort   10.105.72.96   <none>        80:30044/TCP,443:31453/TCP   3h
+```
+
+为了后面方便使用，我会把上述访问入口设置为环境变量：
+
+```
+$ IC_IP=10.168.0.2 # 任意一台宿主机的地址
+$ IC_HTTPS_PORT=31453 # NodePort端口
+```
+
+在 Ingress Controller 和它所需要的 Service 部署完成后，我们就可以使用它了。
+
+> 备注：这个“咖啡厅”Ingress 的所有示例文件，都在[这里](https://github.com/resouer/kubernetes-ingress/tree/master/examples/complete-example)。
+
+首先，我们要在集群里部署我们的应用 Pod 和它们对应的 Service，如下所示：
+
+```
+$ kubectl create -f cafe.yaml
+```
+
+然后，我们需要创建 Ingress 所需的 SSL 证书（tls.crt）和密钥（tls.key），这些信息都是通过 Secret 对象定义好的，如下所示：
+
+```
+$ kubectl create -f cafe-secret.yaml
+```
+
+这一步完成后，我们就可以创建在本篇文章一开始定义的 Ingress 对象了，如下所示：
+
+```
+$ kubectl create -f cafe-ingress.yaml
+```
+
+这时候，我们就可以查看一下这个 Ingress 对象的信息，如下所示：
+
+```
+$ kubectl get ingress
+NAME           HOSTS              ADDRESS   PORTS     AGE
+cafe-ingress   cafe.example.com             80, 443   2h
+
+$ kubectl describe ingress cafe-ingress
+Name:             cafe-ingress
+Namespace:        default
+Address:          
+Default backend:  default-http-backend:80 (<none>)
+TLS:
+  cafe-secret terminates cafe.example.com
+Rules:
+  Host              Path  Backends
+  ----              ----  --------
+  cafe.example.com  
+                    /tea      tea-svc:80 (<none>)
+                    /coffee   coffee-svc:80 (<none>)
+Annotations:
+Events:
+  Type    Reason  Age   From                      Message
+  ----    ------  ----  ----                      -------
+  Normal  CREATE  4m    nginx-ingress-controller  Ingress default/cafe-ingress
+```
+
+可以看到，这个 Ingress 对象最核心的部分，正是 Rules 字段。其中，我们定义的 Host 是`cafe.example.com`，它有两条转发规则（Path），分别转发给 tea-svc 和 coffee-svc。
+
+
+
+> 当然，在 Ingress 的 YAML 文件里，你还可以定义多个 Host，比如`restaurant.example.com`、`movie.example.com`等等，来为更多的域名提供负载均衡服务。
+
+
+
+接下来，我们就可以通过访问这个 Ingress 的地址和端口，访问到我们前面部署的应用了，比如，当我们访问`https://cafe.example.com:443/coffee`时，应该是 coffee 这个 Deployment 负责响应我的请求。我们可以来尝试一下：
+
+```
+$ curl --resolve cafe.example.com:$IC_HTTPS_PORT:$IC_IP https://cafe.example.com:$IC_HTTPS_PORT/coffee --insecureServer address: 10.244.1.56:80
+Server name: coffee-7dbb5795f6-vglbv
+Date: 03/Nov/2018:03:55:32 +0000
+URI: /coffee
+Request ID: e487e672673195c573147134167cf898
+```
+
+我们可以看到，访问这个 URL 得到的返回信息是：Server name: coffee-7dbb5795f6-vglbv。这正是 coffee 这个 Deployment 的名字。
+
+
+
+而当我访问`https://cafe.example.com:433/tea`的时候，则应该是 tea 这个 Deployment 负责响应我的请求（Server name: tea-7d57856c44-lwbnp），如下所示：
+
+```
+$ curl --resolve cafe.example.com:$IC_HTTPS_PORT:$IC_IP https://cafe.example.com:$IC_HTTPS_PORT/tea --insecure
+Server address: 10.244.1.58:80
+Server name: tea-7d57856c44-lwbnp
+Date: 03/Nov/2018:03:55:52 +0000
+URI: /tea
+Request ID: 32191f7ea07cb6bb44a1f43b8299415c
+
+```
+
+可以看到，Nginx Ingress Controller 为我们创建的 Nginx 负载均衡器，已经成功地将请求转发给了对应的后端 Service。
+
+以上，就是 Kubernetes 里 Ingress 的设计思想和使用方法了。
+
+
+
+不过，你可能会有一个疑问，**如果我的请求没有匹配到任何一条 IngressRule，那么会发生什么呢？**
+
+首先，既然 Nginx Ingress Controller 是用 Nginx 实现的，那么它当然会为你返回一个 Nginx 的 404 页面。
+
+不过，Ingress Controller 也允许你通过 Pod 启动命令里的–default-backend-service 参数，设置一条默认规则，比如：–default-backend-service=nginx-default-backend。
+
+这样，任何匹配失败的请求，就都会被转发到这个名叫 nginx-default-backend 的 Service。所以，你就可以通过部署一个专门的 Pod，来为用户返回自定义的 404 页面了。
+
+
+
+### 总结
+
+这篇文章里详细讲解了 Ingress 这个概念在 Kubernetes 里到底是怎么一回事儿。Ingress 实际上就是 Kubernetes 对“反向代理”的抽象。
+
+
+
+目前，Ingress 只能工作在七层，而 Service 只能工作在四层。所以当你想要在 Kubernetes 里为应用进行 TLS 配置等 HTTP 相关的操作时，都必须通过 Ingress 来进行。
+
+当然，正如同很多负载均衡项目可以同时提供七层和四层代理一样，将来 Ingress 的进化中，也会加入四层代理的能力。这样，一个比较完善的“反向代理”机制就比较成熟了。
+
+而 Kubernetes 提出 Ingress 概念的原因其实也非常容易理解，有了 Ingress 这个抽象，用户就可以根据自己的需求来自由选择 Ingress Controller。比如，如果你的应用对代理服务的中断非常敏感，那么你就应该考虑选择类似于 Traefik 这样支持“热加载”的 Ingress Controller 实现。
+
+更重要的是，一旦你对社区里现有的 Ingress 方案感到不满意，或者你已经有了自己的负载均衡方案时，你只需要做很少的编程工作，就可以实现一个自己的 Ingress Controller。
+
+在实际的生产环境中，Ingress 带来的灵活度和自由度，对于使用容器的用户来说，其实是非常有意义的。要知道，当年在 Cloud Foundry 项目里，不知道有多少人为了给 Gorouter 组件配置一个 TLS 而伤透了脑筋。
+
+### 思考题
+
+如果我的需求是，当访问`www.mysite.com`和 `forums.mysite.com`时，分别访问到不同的 Service（比如：site-svc 和 forums-svc）。那么，这个 Ingress 该如何定义呢？请你描述出 YAML 文件中的 rules 字段。
+
+```
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mysite-ingress
+spec:
+  rules:
+    - host: www.mysite.com
+      http:
+        paths:
+          - pathType: Prefix
+            path: "/"
+            backend:
+              service:
+                name: site-svc
+                port:
+                  number: 80
+    - host: forums.mysite.com
+      http:
+        paths:
+          - pathType: Prefix
+            path: "/"
+            backend:
+              service:
+                name: forums-svc
+                port:
+                  number: 80
+```
+
+在上述示例中，rules字段定义了两个规则：
+
+1. 第一个规则指定了当访问www.mysite.com时的路由规则。它使用host字段指定了主机名为www.mysite.com。然后，http字段定义了针对该主机的HTTP路由规则。在paths字段中，我们使用pathType字段指定了路径类型为Prefix，表示匹配以指定路径开头的所有请求。path字段指定了要匹配的路径为"/"，即根路径。最后，backend字段指定了要将匹配的请求转发到的Service，这里是site-svc。
+2. 第二个规则指定了当访问forums.mysite.com时的路由规则。它的定义方式与第一个规则类似，只是host字段指定了主机名为forums.mysite.com，并且backend字段指定了要将匹配的请求转发到的Service为forums-svc。
 
 
 
 # Kubernetes作业调度与资源管理
 
 > shedule
+
+## 40 | Kubernetes的资源模型与资源管理
+
+作为一个容器集群编排与管理项目，Kubernetes 为用户提供的基础设施能力，不仅包括了**应用定义和描述**的部分，还包括了**对应用的资源管理和调度的处理**。
+
+而作为 Kubernetes 的资源管理与调度部分的基础，我们要从它的资源模型开始说起。
+
+在 Kubernetes 里，Pod 是最小的原子调度单位。这也就意味着，所有跟调度和资源管理相关的属性都应该是属于 Pod 对象的字段。而这其中最重要的部分，就是 Pod 的 CPU 和内存配置（resources），如下所示：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: frontend
+spec:
+  containers:
+  - name: db
+    image: mysql
+    env:
+    - name: MYSQL_ROOT_PASSWORD
+      value: "password"
+    resources:
+      requests:
+        memory: "64Mi"
+        cpu: "250m"
+      limits:
+        memory: "128Mi"
+        cpu: "500m"
+  - name: wp
+    image: wordpress
+    resources:
+      requests:
+        memory: "64Mi"
+        cpu: "250m"
+      limits:
+        memory: "128Mi"
+        cpu: "500m"
+```
+
+> 备注：关于哪些属性属于 Pod 对象，而哪些属性属于 Container，你可以在回顾一下第 14 篇文章[《深入解析 Pod 对象（一）：基本概念》](https://time.geekbang.org/column/article/40366)中的相关内容。
+
+
+
+### 资源模型
+
+在 Kubernetes 中，像 CPU 这样的资源被称作**“可压缩资源”（compressible resources）**。它的典型特点是，当可压缩资源不足时，Pod 只会“饥饿”，但不会退出。
+
+而像内存这样的资源，则被称作**“不可压缩资源“（incompressible resources）**。当不可压缩资源不足时，Pod 就会因为 OOM（Out-Of-Memory）被内核杀掉。
+
+而由于 Pod 可以由多个 Container 组成，所以 CPU 和内存资源的限额，是要配置在每个 Container 的定义上的。这样，Pod 整体的资源配置，就由这些 Container 的配置值累加得到。
+
+其中，Kubernetes 里为 CPU 设置的单位是“CPU 的个数”。比如，cpu=1 指的就是，这个 Pod 的 CPU 限额是 1 个 CPU。当然，具体“1 个 CPU”在宿主机上如何解释，是 1 个 CPU 核心，还是 1 个 vCPU，还是 1 个 CPU 的超线程（Hyperthread），完全取决于宿主机的 CPU 实现方式。Kubernetes 只负责保证 Pod 能够使用到“1 个 CPU”的计算能力。
+
+此外，**Kubernetes 允许你将 CPU 限额设置为分数**，比如在我们的例子里，CPU limits 的值就是 500m。所谓 500m，指的就是 500 millicpu(毫），也就是 0.5 个 CPU 的意思。这样，这个 Pod 就会被分配到 1 个 CPU 一半的计算能力。
+
+当然，**你也可以直接把这个配置写成 cpu=0.5。但在实际使用时，我还是推荐你使用 500m 的写法，毕竟这才是 Kubernetes 内部通用的 CPU 表示方式。**
+
+而对于内存资源来说，它的单位自然就是 bytes。Kubernetes 支持你使用 Ei、Pi、Ti、Gi、Mi、Ki（或者 E、P、T、G、M、K）的方式来作为 bytes 的值。比如，在我们的例子里，Memory requests 的值就是 64MiB (2 的 26 次方 bytes) 。这里要注意区分 MiB（mebibyte）和 MB（megabyte）的区别。
+
+> 备注：1Mi=1024*1024；1M=1000*1000
+
+此外，不难看到，**Kubernetes 里 Pod 的 CPU 和内存资源，实际上还要分为 limits 和 requests 两种情况**，如下所示：
+
+```
+spec.containers[].resources.limits.cpu
+spec.containers[].resources.limits.memory 
+spec.containers[].resources.requests.cpu 
+spec.containers[].resources.requests.memory
+```
+
+
+
+这两者的区别其实非常简单：**在调度的时候，kube-scheduler 只会按照 requests 的值进行计算。而在真正设置 Cgroups 限制的时候，kubelet 则会按照 limits 的值来进行设置**。
+
+更确切地说，当你指定了 requests.cpu=250m 之后，相当于将 Cgroups 的 cpu.shares 的值设置为 (250/1000)*1024。而当你没有设置 requests.cpu 的时候，cpu.shares 默认则是 1024。这样，Kubernetes 就通过 cpu.shares 完成了对 CPU 时间的按比例分配。
+
+而如果你指定了 limits.cpu=500m 之后，则相当于将 Cgroups 的 cpu.cfs_quota_us 的值设置为 (500/1000)*100ms，而 cpu.cfs_period_us 的值始终是 100ms。这样，Kubernetes 就为你设置了这个容器只能用到 CPU 的 50%。
+
+
+
+而对于内存来说，当你指定了 limits.memory=128Mi 之后，相当于将 Cgroups 的 memory.limit_in_bytes 设置为 128 * 1024 * 1024。而需要注意的是，在调度的时候，调度器只会使用 requests.memory=64Mi 来进行判断。
+
+**Kubernetes 这种对 CPU 和内存资源限额的设计，实际上参考了 Borg 论文中对“动态资源边界”的定义**，既：容器化作业在提交时所设置的资源边界，并不一定是调度系统所必须严格遵守的，这是因为在实际场景中，大多数作业使用到的资源其实远小于它所请求的资源限额。
+
+
+
+基于这种假设，Borg 在作业被提交后，会主动减小它的资源限额配置，以便容纳更多的作业、提升资源利用率。而当作业资源使用量增加到一定阈值时，Borg 会通过“快速恢复”过程，还原作业原始的资源限额，防止出现异常情况。
+
+而 Kubernetes 的 requests+limits 的做法，其实就是上述思路的一个简化版：用户在提交 Pod 时，可以声明一个相对较小的 requests 值供调度器使用，而 Kubernetes 真正设置给容器 Cgroups 的，则是相对较大的 limits 值。不难看到，这跟 Borg 的思路相通的。
+
+
+
+###  QoS 模型
+
+在理解了 Kubernetes 资源模型的设计之后，我再来和你谈谈 Kubernetes 里的 QoS 模型。在 Kubernetes 中，不同的 requests 和 limits 的设置方式，其实会将这个 Pod 划分到不同的 QoS 级别当中。
+
+**当 Pod 里的每一个 Container 都同时设置了 requests 和 limits，并且 requests 和 limits 值相等的时候，这个 Pod 就属于 Guaranteed（保证） 类别**，如下所示：
+
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qos-demo
+  namespace: qos-example
+spec:
+  containers:
+  - name: qos-demo-ctr
+    image: nginx
+    resources:
+      limits:
+        memory: "200Mi"
+        cpu: "700m"
+      requests:
+        memory: "200Mi"
+        cpu: "700m"
+```
+
+当这个 Pod 创建之后，它的 qosClass 字段就会被 Kubernetes 自动设置为 Guaranteed。需要注意的是，当 Pod 仅设置了 limits 没有设置 requests 的时候，Kubernetes 会自动为它设置与 limits 相同的 requests 值，所以，这也属于 Guaranteed 情况。
+
+
+
+**而当 Pod 不满足 Guaranteed 的条件，但至少有一个 Container 设置了 requests。那么这个 Pod 就会被划分到 Burstable（可超频） 类别**。比如下面这个例子：
+
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qos-demo-2
+  namespace: qos-example
+spec:
+  containers:
+  - name: qos-demo-2-ctr
+    image: nginx
+    resources:
+      limits
+        memory: "200Mi"
+      requests:
+        memory: "100Mi"
+```
+
+**而如果一个 Pod 既没有设置 requests，也没有设置 limits，那么它的 QoS 类别就是 BestEffort**。比如下面这个例子：
+
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qos-demo-3
+  namespace: qos-example
+spec:
+  containers:
+  - name: qos-demo-3-ctr
+    image: nginx
+```
+
+那么，Kubernetes 为 Pod 设置这样三种 QoS 类别，具体有什么作用呢？
+
+实际上，**QoS 划分的主要应用场景，是当宿主机资源紧张的时候，kubelet 对 Pod 进行 Eviction（即资源回收）时需要用到的。**
+
+
+
+具体地说，当 Kubernetes 所管理的宿主机上不可压缩资源短缺时，就有可能触发 Eviction。比如，可用内存（memory.available）、可用的宿主机磁盘空间（nodefs.available），以及容器运行时镜像存储空间（imagefs.available）等等。
+
+目前，Kubernetes 为你设置的 Eviction 的默认阈值如下所示：
+
+```
+memory.available<100Mi
+nodefs.available<10%
+nodefs.inodesFree<5%
+imagefs.available<15%
+```
+
+当然，上述各个触发条件在 kubelet 里都是可配置的。比如下面这个例子：
+
+```
+kubelet --eviction-hard=imagefs.available<10%,memory.available<500Mi,nodefs.available<5%,nodefs.inodesFree<5% --eviction-soft=imagefs.available<30%,nodefs.available<10% --eviction-soft-grace-period=imagefs.available=2m,nodefs.available=2m --eviction-max-pod-grace-period=600
+```
+
+
+
+在这个配置中，你可以看到 **Eviction 在 Kubernetes 里其实分为 Soft 和 Hard 两种模式**。
+
+其中，Soft Eviction 允许你为 Eviction 过程设置一段“优雅时间”，比如上面例子里的 imagefs.available=2m，就意味着当 imagefs 不足的阈值达到 2 分钟之后，kubelet 才会开始 Eviction 的过程。
+
+而 Hard Eviction 模式下，Eviction 过程就会在阈值达到之后立刻开始。
+
+> Kubernetes 计算 Eviction 阈值的数据来源，主要依赖于从 Cgroups 读取到的值，以及使用 cAdvisor 监控到的数据。
+
+当宿主机的 Eviction 阈值达到后，就会进入 MemoryPressure 或者 DiskPressure 状态，从而避免新的 Pod 被调度到这台宿主机上。
+
+而当 Eviction 发生的时候，kubelet 具体会挑选哪些 Pod 进行删除操作，就需要参考这些 Pod 的 QoS 类别了。
+
+- 首当其冲的，自然是 BestEffort 类别的 Pod。
+- 其次，是属于 Burstable 类别、并且发生“饥饿”的资源使用量已经超出了 requests 的 Pod。
+- 最后，才是 Guaranteed 类别。并且，Kubernetes 会保证只有当 Guaranteed 类别的 Pod 的资源使用量超过了其 limits 的限制，或者宿主机本身正处于 Memory Pressure 状态时，Guaranteed 的 Pod 才可能被选中进行 Eviction 操作。
+
+
+
+当然，对于同 QoS 类别的 Pod 来说，Kubernetes 还会根据 Pod 的优先级来进行进一步地排序和选择。
+
+
+
+### cpuset 的设置
+
+在理解了 Kubernetes 里的 QoS 类别的设计之后，我再来为你讲解一下 Kubernetes 里一个非常有用的特性：cpuset 的设置。
+
+我们知道，在使用容器的时候，你可以通过设置 cpuset 把容器绑定到某个 CPU 的核上，而不是像 cpushare 那样共享 CPU 的计算能力。
+
+这种情况下，由于操作系统在 CPU 之间进行上下文切换的次数大大减少，容器里应用的性能会得到大幅提升。事实上，**cpuset 方式，是生产环境里部署在线应用类型的 Pod 时，非常常用的一种方式。**
+
+可是，这样的需求在 Kubernetes 里又该如何实现呢？
+
+
+
+其实非常简单。
+
+- 首先，你的 Pod 必须是 Guaranteed 的 QoS 类型；
+- 然后，你只需要将 Pod 的 CPU 资源的 requests 和 limits 设置为同一个相等的整数值即可。
+
+比如下面这个例子：
+
+```
+spec:
+  containers:
+  - name: nginx
+    image: nginx
+    resources:
+      limits:
+        memory: "200Mi"
+        cpu: "2"
+      requests:
+        memory: "200Mi"
+        cpu: "2"
+```
+
+这时候，该 Pod 就会被绑定在 2 个独占的 CPU 核上。当然，具体是哪两个 CPU 核，是由 kubelet 为你分配的。
+
+以上，就是 Kubernetes 的资源模型和 QoS 类别相关的主要内容。
+
+### 总结
+
+本篇文章中详细讲解了 Kubernetes 里对资源的定义方式和资源模型的设计。然后，我为你讲述了 Kubernetes 里对 Pod 进行 Eviction 的具体策略和实践方式。
+
+正是基于上述讲述，在实际的使用中，我强烈建议你将 DaemonSet 的 Pod 都设置为 Guaranteed 的 QoS 类型。否则，一旦 DaemonSet 的 Pod 被回收，它又会立即在原宿主机上被重建出来，这就使得前面资源回收的动作，完全没有意义了。
+
+
+
+### 思考题
+
+为什么宿主机进入 MemoryPressure 或者 DiskPressure 状态后，新的 Pod 就不会被调度到这台宿主机上呢？
+
+> chatGPT
+
+因为Kubernetes调度器会根据节点的资源情况和条件进行调度决策。
+
+1. MemoryPressure（内存压力）：当宿主机的内存资源接近耗尽或超过阈值时，会触发MemoryPressure状态。这可能是由于宿主机上运行的进程或容器消耗了大量的内存资源。在这种情况下，Kubernetes调度器会避免将新的Pod调度到该宿主机上，以防止进一步加剧内存压力，保证已运行的Pod能够正常工作。
+2. DiskPressure（磁盘压力）：当宿主机的磁盘空间接近耗尽或超过阈值时，会触发DiskPressure状态。这可能是由于磁盘上的文件或容器日志占用了大量的磁盘空间。在这种情况下，Kubernetes调度器会避免将新的Pod调度到该宿主机上，以防止进一步加剧磁盘压力，保证已运行的Pod能够正常写入和读取数据。
+
+通过避免将新的Pod调度到MemoryPressure或DiskPressure状态的宿主机上，Kubernetes可以确保集群中的资源分配合理，避免过度消耗资源导致系统性能下降或崩溃。同时，这也为管理员提供了机会来处理宿主机上的资源问题，例如清理磁盘空间或优化内存使用，以恢复正常的调度能力。
+
+
 
 
 
