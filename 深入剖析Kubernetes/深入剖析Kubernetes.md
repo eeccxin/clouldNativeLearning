@@ -8936,6 +8936,12 @@ spec:
 
    当一个已调度的Pod被更新时，例如修改了亲和性或反亲和性规则，这可能导致与该Pod有关联的其他Pod无法满足新的调度要求。为了解决这个问题，调度器会将这些相关的Pod从unschedulableQ移动到activeQ中，以便重新评估它们的调度情况，并尝试将它们重新调度到满足新要求的节点上。
 
+
+
+
+
+
+
 ## 44 | Kubernetes GPU管理与Device Plugin机制
 
 2016 年，随着 AlphaGo 的走红和 TensorFlow 项目的异军突起，一场名为 AI 的技术革命迅速从学术界蔓延到了工业界，所谓的 AI 元年，就此拉开帷幕。
@@ -8952,7 +8958,7 @@ spec:
 
 
 
-### GPU管理的配置方法
+### GPU管理方式
 
 以 NVIDIA 的 GPU 设备为例，上面的需求就意味着当用户的容器被创建之后，这个容器里必须出现如下两部分设备和目录：
 
@@ -9103,15 +9109,42 @@ Kubernetes 的 Device Plugin 机制，可以用如下所示的一幅示意图来
 
 ### 总结
 
+本篇文章中详细讲述了 Kubernetes 对 GPU 的管理方式，以及它所需要使用的 Device Plugin 机制。
+
+需要指出的是，Device Plugin 的设计，长期以来都是以 Google Cloud 的用户需求为主导的，所以，它的整套工作机制和流程上，实际上跟学术界和工业界的真实场景还有着不小的差异。
+
+这里最大的问题在于，GPU 等硬件设备的调度工作，实际上是由 kubelet 完成的。即，kubelet 会负责从它所持有的硬件设备列表中，为容器挑选一个硬件设备，然后调用 Device Plugin 的 Allocate API 来完成这个分配操作。可以看到，在整条链路中，调度器扮演的角色，仅仅是为 Pod 寻找到可用的、支持这种硬件设备的节点而已。
+
+这就使得，Kubernetes 里对硬件设备的管理，只能处理“设备个数”这唯一一种情况。一旦你的设备是异构的、不能简单地用“数目”去描述具体使用需求的时候，比如，“我的 Pod 想要运行在计算能力最强的那个 GPU 上”，Device Plugin 就完全不能处理了。
 
 
 
+更不用说，在很多场景下，我们其实希望在调度器进行调度的时候，就可以根据整个集群里的某种硬件设备的全局分布，做出一个最佳的调度选择。
+
+此外，上述 Device Plugin 的设计，也使得 Kubernetes 里，缺乏一种能够对 Device 进行描述的 API 对象。这就使得如果你的硬件设备本身的属性比较复杂，并且 Pod 也关心这些硬件的属性的话，那么 Device Plugin 也是完全没有办法支持的。
+
+更为棘手的是，在 Device Plugin 的设计和实现中，Google 的工程师们一直不太愿意为 Allocate 和 ListAndWatch API 添加可扩展性的参数。这就使得，当你确实需要处理一些比较复杂的硬件设备使用需求时，是没有办法通过扩展 Device Plugin 的 API 来实现的。
 
 
 
+针对这些问题，RedHat 在社区里曾经大力推进过 [ResourceClass](https://github.com/kubernetes/community/pull/2265)的设计，试图将硬件设备的管理功能上浮到 API 层和调度层。但是，由于各方势力的反对，这个提议最后不了了之了。
+
+所以说，目前 Kubernetes 本身的 Device Plugin 的设计，实际上能覆盖的场景是非常单一的，属于“可用”但是“不好用”的状态。并且， Device Plugin 的 API 本身的可扩展性也不是很好。这也就解释了为什么像 NVIDIA 这样的硬件厂商，实际上并没有完全基于上游的 Kubernetes 代码来实现自己的 GPU 解决方案，而是做了一定的改动，也就是 fork。这，实属不得已而为之。
 
 
 
+### 思考题
+
+请你结合自己的需求谈一谈，你希望如何对当前的 Device Plugin 进行改进呢？或者说，你觉得当前的设计已经完全够用了吗？
+
+> chatGPT
+
+尽管当前的Device Plugin设计已经为许多使用场景提供了解决方案，但仍然存在一些改进的空间：
+
+1. 管理和配置：改进Device Plugin的管理和配置体验，使其更加简单和灵活。例如，提供更友好的命令行工具或Web界面，以便管理员可以更轻松地管理和配置设备插件。
+2. 扩展性：进一步提高Device Plugin的扩展性，使其能够支持更多类型的设备资源。目前，Device Plugin主要关注GPU等设备，但随着边缘计算和物联网的发展，可能会涉及到更多类型的设备资源，如传感器、加速器等。
+3. 资源调度：改进Device Plugin的资源调度算法，以更好地满足不同Pod对设备资源的需求。这可能涉及到更精细的资源配额管理、调度策略和优先级设置等。
+4. 安全性：加强Device Plugin的安全性，确保设备资源的访问和使用是受到适当的权限和认证控制的。这可以包括身份验证、访问控制和审计等机制。
 
 
 
@@ -9120,6 +9153,188 @@ Kubernetes 的 Device Plugin 机制，可以用如下所示的一幅示意图来
 # Kubernetes容器运行时
 
 > CRI
+
+## 45 | 幕后英雄：SIG-Node与CRI
+
+实际上，在调度这一步完成后，Kubernetes 就需要负责将这个调度成功的 Pod，在宿主机上创建出来，并把它所定义的各个容器启动起来。这些，都是 kubelet 这个核心组件的主要功能。
+
+接下来三篇文章中深入到 kubelet 里面，为你详细剖析一下 Kubernetes 对容器运行时的管理能力。
+
+在 Kubernetes 社区里，与 kubelet 以及容器运行时管理相关的内容，都属于 SIG-Node 的范畴。如果你经常参与社区的话，你可能会觉得，相比于其他每天都热闹非凡的 SIG 小组，SIG-Node 是 Kubernetes 里相对沉寂也不太发声的一个小组，小组里的成员也很少在外面公开宣讲。
+
+
+
+不过，正如我前面所介绍的，SIG-Node 以及 kubelet，其实是 Kubernetes 整套体系里非常核心的一个部分。 毕竟，它们才是 Kubernetes 这样一个容器编排与管理系统，跟容器打交道的主要“场所”。
+
+
+
+而 kubelet 这个组件本身，也是 Kubernetes 里面第二个不可被替代的组件（第一个不可被替代的组件当然是 kube-apiserver）。也就是说，**无论如何，我都不太建议你对 kubelet 的代码进行大量的改动。保持 kubelet 跟上游基本一致的重要性，就跟保持 kube-apiserver 跟上游一致是一个道理。**
+
+
+
+### kubeltet工作原理
+
+当然， kubelet 本身，也是按照**“控制器”模式**来工作的。它实际的工作原理，可以用如下所示的一幅示意图来表示清楚。
+
+<img src="深入剖析Kubernetes.assets/914e097aed10b9ff39b509759f8b1d03.png" alt="img" style="zoom:50%;" />
+
+
+
+可以看到，kubelet 的工作核心，就是一个控制循环，即：**SyncLoop**（图中的大圆圈）。而驱动这个控制循环运行的事件，包括四种：
+
+1. Pod 更新事件；
+2. Pod 生命周期变化；
+3. kubelet 本身设置的执行周期；
+4. 定时的清理事件。
+
+所以，跟其他控制器类似，kubelet 启动的时候，要做的第一件事情，就是设置 Listers，也就是注册它所关心的各种事件的 Informer。这些 Informer，就是 SyncLoop 需要处理的数据的来源。
+
+
+
+此外，kubelet 还负责维护着很多很多其他的子控制循环（也就是图中的小圆圈）。这些控制循环的名字，一般被称作某某 Manager，比如 Volume Manager、Image Manager、Node Status Manager 等等。
+
+
+
+不难想到，这些控制循环的责任，就是通过控制器模式，完成 kubelet 的某项具体职责。比如 Node Status Manager，就负责响应 Node 的状态变化，然后将 Node 的状态收集起来，并通过 Heartbeat 的方式上报给 APIServer。再比如 CPU Manager，就负责维护该 Node 的 CPU 核的信息，以便在 Pod 通过 cpuset 的方式请求 CPU 核的时候，能够正确地管理 CPU 核的使用量和可用量。
+
+
+
+### syncLoop 与小loop
+
+那么这个 **SyncLoop，又是如何根据 Pod 对象的变化，来进行容器操作的呢？**
+
+实际上，kubelet 也是通过 Watch 机制，监听了与自己相关的 Pod 对象的变化。当然，这个 Watch 的过滤条件是该 Pod 的 nodeName 字段与自己相同。kubelet 会把这些 Pod 的信息缓存在自己的内存里。
+
+
+
+而当一个 Pod 完成调度、与一个 Node 绑定起来之后， 这个 Pod 的变化就会触发 kubelet 在控制循环里注册的 Handler，也就是上图中的 HandlePods 部分。此时，通过检查该 Pod 在 kubelet 内存里的状态，kubelet 就能够判断出这是一个新调度过来的 Pod，从而触发 Handler 里 ADD 事件对应的处理逻辑。
+
+
+
+在具体的处理过程当中，kubelet 会启动一个名叫 Pod Update Worker 的、单独的 Goroutine 来完成对 Pod 的处理工作。
+
+比如，如果是 ADD 事件的话，kubelet 就会为这个新的 Pod 生成对应的 Pod Status，检查 Pod 所声明使用的 Volume 是不是已经准备好。然后，调用下层的容器运行时（比如 Docker），开始创建这个 Pod 所定义的容器。
+
+
+
+而如果是 UPDATE 事件的话，kubelet 就会根据 Pod 对象具体的变更情况，调用下层容器运行时进行容器的重建工作。
+
+在这里需要注意的是，**kubelet 调用下层容器运行时的执行过程，并不会直接调用 Docker 的 API，而是通过一组叫作 CRI（Container Runtime Interface，容器运行时接口）的 gRPC 接口来间接执行的。**
+
+
+
+Kubernetes 项目之所以要在 kubelet 中引入这样一层单独的抽象，当然是为了对 Kubernetes 屏蔽下层容器运行时的差异。实际上，对于 **1.6 版本**之前的 Kubernetes 来说，它就是直接调用 Docker 的 API 来创建和管理容器的。
+
+
+
+Docker 项目风靡全球后不久，CoreOS 公司就推出了 rkt 项目来与 Docker 正面竞争。在这种背景下，Kubernetes 项目的默认容器运行时，自然也就成了两家公司角逐的重要战场。
+
+毋庸置疑，Docker 项目必然是 Kubernetes 项目最依赖的容器运行时。但凭借与 Google 公司非同一般的关系，CoreOS 公司还是在 2016 年成功地将对 rkt 容器的支持，直接添加进了 kubelet 的主干代码里。
+
+不过，这个“赶鸭子上架”的举动，并没有为 rkt 项目带来更多的用户，反而给 kubelet 的维护人员，带来了巨大的负担。
+
+
+
+不难想象，在这种情况下， **kubelet 任何一次重要功能的更新，都不得不考虑 Docker 和 rkt 这两种容器运行时的处理场景，然后分别更新 Docker 和 rkt 两部分代码。**
+
+
+
+更让人为难的是，由于 rkt 项目实在太小众，kubelet 团队所有与 rkt 相关的代码修改，都必须依赖于 CoreOS 的员工才能做到。这不仅拖慢了 kubelet 的开发周期，也给项目的稳定性带来了巨大的隐患。
+
+与此同时，在 2016 年，Kata Containers 项目的前身 runV 项目也开始逐渐成熟，这种基于虚拟化技术的强隔离容器，与 Kubernetes 和 Linux 容器项目之间具有良好的互补关系。所以，**在 Kubernetes 上游，对虚拟化容器的支持很快就被提上了日程。**
+
+
+
+不过，虽然虚拟化容器运行时有各种优点，但它与 Linux 容器截然不同的实现方式，使得它跟 Kubernetes 的集成工作，比 rkt 要复杂得多。如果此时，再把对 runV 支持的代码也一起添加到 kubelet 当中，那么接下来 kubelet 的维护工作就可以说完全没办法正常进行了。
+
+
+
+所以，在 2016 年，SIG-Node 决定开始动手解决上述问题。而解决办法也很容易想到，那就是把 kubelet 对容器的操作，统一地抽象成一个接口。这样，kubelet 就只需要跟这个接口打交道了。而作为具体的容器项目，比如 Docker、 rkt、runV，它们就只需要自己提供一个该接口的实现，然后对 kubelet 暴露出 gRPC 服务即可。
+
+
+
+这一层统一的容器操作接口，就是 CRI 了。
+
+而在有了 CRI 之后，Kubernetes 以及 kubelet 本身的架构，就可以用如下所示的一幅示意图来描述。
+
+<img src="深入剖析Kubernetes.assets/5161bd6201942f7a1ed6d70d7d55acfe.png" alt="img" style="zoom:50%;" />
+
+可以看到，当 Kubernetes 通过编排能力创建了一个 Pod 之后，调度器会为这个 Pod 选择一个具体的节点来运行。这时候，kubelet 当然就会通过前面讲解过的 SyncLoop 来判断需要执行的具体操作，比如创建一个 Pod。那么此时，kubelet 实际上就会调用一个叫作 **GenericRuntime** 的通用组件来发起创建 Pod 的 CRI 请求。
+
+
+
+那么，**这个 CRI 请求，又该由谁来响应呢？**
+
+
+
+如果你使用的容器项目是 Docker 的话，那么负责响应这个请求的就是一个叫作 dockershim 的组件。它会把 CRI 请求里的内容拿出来，然后组装成 Docker API 请求发给 Docker Daemon。
+
+需要注意的是，在 Kubernetes 目前的实现里，dockershim 依然是 kubelet 代码的一部分。当然，在将来，dockershim 肯定会被从 kubelet 里移出来，甚至直接被废弃掉。
+
+而更普遍的场景，就是你需要在每台宿主机上单独安装一个负责响应 CRI 的组件，这个组件，一般被称作 CRI shim。顾名思义，CRI shim 的工作，就是扮演 kubelet 与容器项目之间的“**垫片”（shim）**。所以它的作用非常单一，那就是实现 CRI 规定的每个接口，然后把具体的 CRI 请求“翻译”成对后端容器项目的请求或者操作。
+
+
+
+### 总结
+
+本篇文章首先为你介绍了 SIG-Node 的职责，以及 kubelet 这个组件的工作原理。
+
+后面文章将为你重点讲解了 kubelet 究竟是如何将 Kubernetes 对应用的定义，一步步转换成最终对 Docker 或者其他容器项目的 API 请求的。
+
+不难看到，在这个过程中，**kubelet 的 SyncLoop 和 CRI 的设计**，是其中最重要的两个关键点。
+
+也正是基于以上设计，SyncLoop 本身就要求这个控制循环是绝对不可以被阻塞的。所以，凡是在 kubelet 里有可能会耗费大量时间的操作，比如准备 Pod 的 Volume、拉取镜像等，SyncLoop 都会开启单独的 Goroutine 来进行操作。
+
+
+
+### 思考题
+
+请问，在你的项目中，你是如何部署 kubelet 这个组件的？为什么要这么做呢？
+
+> chatGPT
+
+在Kubernetes项目中，kubelet是集群中每个节点上运行的重要组件之一。它负责管理节点上的容器和Pod，并与Kubernetes控制平面进行通信。
+
+部署kubelet的一般做法是：
+
+1. 安装Kubernetes：首先，需要在节点上安装Kubernetes软件包，以便获取kubelet二进制文件和其他相关组件。
+2. 配置kubelet：然后，需要配置kubelet的参数和选项，以适应特定的环境和需求。这些配置包括节点名称、集群地址、认证凭据、资源配额等。
+3. 启动kubelet：最后，通过启动kubelet进程来运行该组件。kubelet会监视节点上的Pod和容器状态，并与控制平面进行通信，以确保Pod的正确调度和运行。
+
+为什么要这么做呢？以下是一些部署kubelet的原因：
+
+1. 容器管理：kubelet负责管理节点上的容器和Pod。通过部署kubelet，可以实现对容器的自动化管理，包括创建、启动、停止和监控等操作。
+2. 资源调度：kubelet与控制平面进行通信，以接收关于Pod调度和资源分配的指令。通过部署kubelet，可以实现集群中的资源调度和负载均衡，确保Pod在节点上得到适当的分配。
+3. 状态报告：kubelet会定期向控制平面报告节点和Pod的状态信息。通过部署kubelet，可以实时了解节点和Pod的健康状况，以便进行故障排查和监控。
+4. 自愈能力：kubelet具有一定的自愈能力，可以监测和恢复节点上的异常情况。通过部署kubelet，可以提高集群的可靠性和稳定性，减少人工干预的需求。
+
+总的来说，部署kubelet是为了实现容器管理、资源调度、状态报告和自愈能力等功能，以提供高效、可靠的容器化环境。具体的部署方式和配置可能因环境和需求而异，需要根据实际情况进行调整和优化
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
