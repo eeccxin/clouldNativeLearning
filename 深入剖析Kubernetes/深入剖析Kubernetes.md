@@ -5497,6 +5497,227 @@ No events.
 
 ### 思考题
 
+在了解了 PV、PVC 的设计和实现原理之后，你是否依然觉得它有“过度设计”的嫌疑？或者，你是否有更加简单、足以解决你 90% 需求的 Volume 的用法？
+
+> chatGPT
+
+在了解了 PV（Persistent Volume）和 PVC（Persistent Volume Claim）的设计和实现原理之后，我认为它们并不具有过度设计的嫌疑。PV 和 PVC 提供了一种灵活且可扩展的机制，用于管理持久化存储的分配和使用。
+
+PV 和 PVC 的设计目的是为了解决容器化环境中持久化存储的管理问题。它们提供了一种抽象层，将底层存储资源与容器解耦，使得容器可以独立于底层存储技术进行操作。这种抽象层的设计使得存储的管理更加灵活，可以适应不同的存储后端和需求。
+
+当然，对于某些简单的应用场景或需求，可能并不需要使用 PV 和 PVC。如果你的需求只是简单地将一个卷挂载到容器中，并不需要进行动态分配、管理和共享等高级功能，那么可以直接使用 Docker 的 Volume 功能。
+
+Docker 的 Volume 功能提供了一种简单而直接的方式来管理容器的存储。你可以使用 `docker run` 命令的 `-v` 参数来指定挂载卷的路径，或者使用 Docker Compose 文件中的 `volumes` 部分来定义卷的挂载。
+
+这种简单的 Volume 用法可以满足大部分简单的需求，而无需引入 PV 和 PVC 的复杂性。但是，如果你的需求涉及到动态分配、管理和共享等高级功能，那么 PV 和 PVC 提供的功能将更加适合。
+
+因此，根据具体的需求和场景，你可以选择使用简单的 Docker Volume 或者更为灵活和强大的 PV 和 PVC。
+
+
+
+## 29 | PV、PVC体系是不是多此一举？从本地持久化卷谈起
+
+上一篇文章中详细讲解了 PV、PVC 持久化存储体系在 Kubernetes 项目中的设计和实现原理。而在文章最后的思考题中，我为你留下了这样一个讨论话题：像 PV、PVC 这样的用法，是不是有“过度设计”的嫌疑？
+
+
+
+比如，我们公司的运维人员可以像往常一样维护一套 NFS 或者 Ceph 服务器，根本不必学习 Kubernetes。而开发人员，则完全可以靠“复制粘贴”的方式，在 Pod 的 YAML 文件里填上 Volumes 字段，而不需要去使用 PV 和 PVC。
+
+
+
+实际上，如果只是为了职责划分，PV、PVC 体系确实不见得比直接在 Pod 里声明 Volumes 字段有什么优势。
+
+
+
+不过，你有没有想过这样一个问题，如果[Kubernetes 内置的 20 种持久化数据卷实现](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#types-of-persistent-volumes)，都没办法满足你的容器存储需求时，该怎么办？
+
+这个情况乍一听起来有点不可思议。但实际上，凡是鼓捣过开源项目的读者应该都有所体会，**“不能用”“不好用”“需要定制开发”，这才是落地开源基础设施项目的三大常态**。
+
+
+
+而在持久化存储领域，用户呼声最高的定制化需求，莫过于支持“本地”持久化存储了。
+
+也就是说，用户希望 Kubernetes 能够直接使用宿主机上的本地磁盘目录，而不依赖于远程存储服务，来提供“持久化”的容器 Volume。
+
+这样做的好处很明显，由于这个 Volume 直接使用的是本地磁盘，尤其是 SSD 盘，它的读写性能相比于大多数远程存储来说，要好得多。这个需求对本地物理服务器部署的私有 Kubernetes 集群来说，非常常见。
+
+
+
+所以，Kubernetes 在 v1.10 之后，就逐渐依靠 PV、PVC 体系实现了这个特性。这个特性的名字叫作：**Local Persistent Volume**。
+
+
+
+不过，首先需要明确的是，**Local Persistent Volume 并不适用于所有应用**。事实上，它的适用范围非常固定，比如：高优先级的系统应用，需要在多个不同节点上存储数据，并且对 I/O 较为敏感。典型的应用包括：分布式数据存储比如 MongoDB、Cassandra 等，分布式文件系统比如 GlusterFS、Ceph 等，以及需要在本地磁盘上进行大量数据缓存的分布式应用。
+
+
+
+其次，相比于正常的 PV，一旦这些节点宕机且不能恢复时，Local Persistent Volume 的数据就可能丢失。这就要求**使用 Local Persistent Volume 的应用必须具备数据备份和恢复的能力**，允许你把这些数据定时备份在其他位置。
+
+接下来，我就为你深入讲解一下这个特性。
+
+
+
+不难想象，Local Persistent Volume 的设计，主要面临两个难点。
+
+**第一个难点在于**：如何把本地磁盘抽象成 PV。
+
+可能你会说，Local Persistent Volume，不就等同于 hostPath 加 NodeAffinity 吗？
+
+比如，一个 Pod 可以声明使用类型为 Local 的 PV，而这个 PV 其实就是一个 hostPath 类型的 Volume。如果这个 hostPath 对应的目录，已经在节点 A 上被事先创建好了。那么，我只需要再给这个 Pod 加上一个 nodeAffinity=nodeA，不就可以使用这个 Volume 了吗？
+
+事实上，**你绝不应该把一个宿主机上的目录当作 PV 使用**。这是因为，这种本地目录的存储行为完全不可控，它所在的磁盘随时都可能被应用写满，甚至造成整个宿主机宕机。而且，不同的本地目录之间也缺乏哪怕最基础的 I/O 隔离机制。
+
+所以，一个 Local Persistent Volume 对应的存储介质，一定是一块额外挂载在宿主机的磁盘或者块设备（“额外”的意思是，它不应该是宿主机根目录所使用的主硬盘）。这个原则，我们可以称为“**一个 PV 一块盘**”。
+
+
+
+**第二个难点在于**：调度器如何保证 Pod 始终能被正确地调度到它所请求的 Local Persistent Volume 所在的节点上呢？
+
+造成这个问题的原因在于，对于常规的 PV 来说，Kubernetes 都是先调度 Pod 到某个节点上，然后，再通过“两阶段处理”来“持久化”这台机器上的 Volume 目录，进而完成 Volume 目录与容器的绑定挂载。
+
+可是，对于 Local PV 来说，节点上可供使用的磁盘（或者块设备），必须是运维人员提前准备好的。它们在不同节点上的挂载情况可以完全不同，甚至有的节点可以没这种磁盘。
+
+所以，这时候，调度器就必须能够知道所有节点与 Local Persistent Volume 对应的磁盘的关联关系，然后根据这个信息来调度 Pod。
+
+
+
+这个原则，我们可以称为“**在调度的时候考虑 Volume 分布**”。在 Kubernetes 的调度器里，有一个叫作 VolumeBindingChecker 的过滤条件专门负责这个事情。在 Kubernetes v1.11 中，这个过滤条件已经默认开启了。
+
+基于上述讲述，在开始使用 Local Persistent Volume 之前，你首先需要在集群里配置好磁盘或者块设备。在公有云上，这个操作等同于给虚拟机额外挂载一个磁盘，比如 GCE 的 Local SSD 类型的磁盘就是一个典型例子。
+
+
+
+而在我们部署的私有环境中，你有两种办法来完成这个步骤。
+
+- 第一种，当然就是给你的宿主机挂载并格式化一个可用的本地磁盘，这也是最常规的操作；
+- 第二种，对于实验环境，你其实可以在宿主机上挂载几个 **RAM Disk（内存盘）**来模拟本地磁盘。
+
+接下来，我会使用第二种方法，在我们之前部署的 Kubernetes 集群上进行实践。
+
+
+
+**首先**，在名叫 node-1 的宿主机上创建一个挂载点，比如 /mnt/disks；**然后**，用几个 RAM Disk 来模拟本地磁盘，如下所示：
+
+```bash
+# 在node-1上执行
+$ mkdir /mnt/disks
+$ for vol in vol1 vol2 vol3; do
+    mkdir /mnt/disks/$vol
+    mount -t tmpfs $vol /mnt/disks/$vol
+done
+```
+
+需要注意的是，如果你希望其他节点也能支持 Local Persistent Volume 的话，那就需要为它们也执行上述操作，并且确保这些磁盘的名字（vol1、vol2 等）都不重复。
+
+接下来，我们就可以为这些本地磁盘定义对应的 PV 了，如下所示：
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: example-pv
+spec:
+  capacity:
+    storage: 5Gi
+  volumeMode: Filesystem
+  accessModes:
+  - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: local-storage
+  local:
+    path: /mnt/disks/vol1
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values:
+          - node-1
+```
+
+可以看到，这个 PV 的定义里：local 字段，指定了它是一个 Local Persistent Volume；而 path 字段，指定的正是这个 PV 对应的本地磁盘的路径，即：/mnt/disks/vol1。
+
+
+
+当然了，这也就意味着如果 Pod 要想使用这个 PV，那它就必须运行在 node-1 上。所以，在这个 PV 的定义里，需要有一个 **nodeAffinity 字段**指定 node-1 这个节点的名字。这样，调度器在调度 Pod 的时候，就能够知道一个 PV 与节点的对应关系，从而做出正确的选择。**这正是 Kubernetes 实现“在调度的时候就考虑 Volume 分布”的主要方法。**
+
+**接下来**，我们就可以使用 kubect create 来创建这个 PV，如下所示：
+
+```bash
+$ kubectl create -f local-pv.yaml 
+persistentvolume/example-pv created
+
+$ kubectl get pv
+NAME         CAPACITY   ACCESS MODES   RECLAIM POLICY  STATUS      CLAIM             STORAGECLASS    REASON    AGE
+example-pv   5Gi        RWO            Delete           Available                     local-storage             16s
+```
+
+可以看到，这个 PV 创建后，进入了 Available（可用）状态。
+
+而正如我在上一篇文章里所建议的那样，使用 PV 和 PVC 的最佳实践，是你要创建一个 StorageClass 来描述这个 PV，如下所示：
+
+```
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: local-storage
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+```
+
+这个 StorageClass 的名字，叫作 local-storage。需要注意的是，在它的 provisioner 字段，我们指定的是 no-provisioner。这是因为 Local Persistent Volume 目前尚不支持 Dynamic Provisioning，所以它没办法在用户创建 PVC 的时候，就自动创建出对应的 PV。也就是说，我们前面创建 PV 的操作，是不可以省略的。
+
+
+
+与此同时，这个 StorageClass 还定义了一个 volumeBindingMode=**WaitForFirstConsumer** 的属性。它是 Local Persistent Volume 里一个非常重要的特性，即：**延迟绑定**。
+
+
+
+我们知道，当你提交了 PV 和 PVC 的 YAML 文件之后，Kubernetes 就会根据它们俩的属性，以及它们指定的 StorageClass 来进行绑定。只有绑定成功后，Pod 才能通过声明这个 PVC 来使用对应的 PV。
+
+可是，如果你使用的是 Local Persistent Volume 的话，就会发现，这个流程根本行不通。
+
+比如，现在你有一个 Pod，它声明使用的 PVC 叫作 pvc-1。并且，我们规定，这个 Pod 只能运行在 node-2 上。
+
+
+
+而在 Kubernetes 集群中，有两个属性（比如：大小、读写权限）相同的 Local 类型的 PV。
+
+其中，第一个 PV 的名字叫作 pv-1，它对应的磁盘所在的节点是 node-1。而第二个 PV 的名字叫作 pv-2，它对应的磁盘所在的节点是 node-2。
+
+假设现在，Kubernetes 的 Volume 控制循环里，首先检查到了 pvc-1 和 pv-1 的属性是匹配的，于是就将它们俩绑定在一起。
+
+然后，你用 kubectl create 创建了这个 Pod。
+
+这时候，问题就出现了。
+
+
+
+调度器看到，这个 Pod 所声明的 pvc-1 已经绑定了 pv-1，而 pv-1 所在的节点是 node-1，根据“调度器必须在调度的时候考虑 Volume 分布”的原则，这个 Pod 自然会被调度到 node-1 上。
+
+可是，我们前面已经规定过，这个 Pod 根本不允许运行在 node-1 上。所以。最后的结果就是，这个 Pod 的调度必然会失败。
+
+**这就是为什么，在使用 Local Persistent Volume 的时候，我们必须想办法推迟这个“绑定”操作。**
+
+那么，具体推迟到什么时候呢？
+
+**答案是：推迟到调度的时候。**
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -9905,6 +10126,746 @@ CRI 是 Kubernetes 中定义容器运行时与容器管理器之间交互的接�
 # Kubernetes容器监控与日志
 
 > Prometheus、日志
+
+## 48 | Prometheus、Metrics Server与Kubernetes监控体系
+
+今天分享的主题是：Prometheus、Metrics Server 与 Kubernetes 监控体系。
+
+
+
+通过前面的文章，我已经和你分享过了 Kubernetes 的核心架构，编排概念，以及具体的设计与实现。接下来，我会用 3 篇文章，为你介绍 Kubernetes 监控相关的一些核心技术。
+
+首先需要明确指出的是，Kubernetes 项目的监控体系曾经非常繁杂，在社区中也有很多方案。但这套体系发展到今天，已经完全演变成了以 Prometheus 项目为核心的一套统一的方案。
+
+
+
+在这里，可能有一些同学对 Prometheus 项目还太不熟悉。所以，我先来简单为你介绍一下这个项目。
+
+实际上，**Prometheus 项目**是当年 CNCF 基金会起家时的“第二把交椅”。而这个项目发展到今天，**已经全面接管了 Kubernetes 项目的整套监控体系**。
+
+比较有意思的是，Prometheus 项目与 Kubernetes 项目一样，也来自于 Google 的 Borg 体系，它的原型系统，叫作 BorgMon，是一个几乎与 Borg 同时诞生的内部监控系统。而 Prometheus 项目的发起原因也跟 Kubernetes 很类似，都是希望通过对用户更友好的方式，将 Google 内部系统的设计理念，传递给用户和开发者。
+
+
+
+作为一个监控系统，Prometheus 项目的作用和工作方式，其实可以用如下所示的一张官方示意图来解释。
+
+<img src="深入剖析Kubernetes.assets/2ada1ece66fcc81d704c2ba46f9dd7d3.png" alt="img" style="zoom:50%;" />
+
+可以看到，Prometheus 项目工作的核心，是使用 Pull （抓取）的方式去搜集被监控对象的 Metrics 数据（监控指标数据），然后，再把这些数据保存在一个 TSDB （时间序列数据库，比如 OpenTSDB、InfluxDB 等）当中，以便后续可以按照时间进行检索。
+
+
+
+有了这套核心监控机制， Prometheus 剩下的组件就是用来配合这套机制的运行。比如 Pushgateway，可以允许被监控对象以 Push 的方式向 Prometheus 推送 Metrics 数据。而 Alertmanager，则可以根据 Metrics 信息灵活地设置报警。当然， Prometheus 最受用户欢迎的功能，还是通过 Grafana 对外暴露出的、可以灵活配置的监控数据可视化界面。
+
+有了 Prometheus 之后，我们就可以按照 Metrics 数据的来源，来对 Kubernetes 的监控体系做一个汇总了。
+
+
+
+**第一种 Metrics，是宿主机的监控数据。**这部分数据的提供，需要借助一个由 Prometheus 维护的[Node Exporter](https://github.com/prometheus/node_exporter) 工具。一般来说，Node Exporter 会以 DaemonSet 的方式运行在宿主机上。其实，所谓的 Exporter，就是代替被监控对象来对 Prometheus 暴露出可以被“抓取”的 Metrics 信息的一个辅助进程。
+
+而 Node Exporter 可以暴露给 Prometheus 采集的 Metrics 数据， 也不单单是节点的负载（Load）、CPU 、内存、磁盘以及网络这样的常规信息，它的 Metrics 指标可以说是“包罗万象”，你可以查看[这个列表](https://github.com/prometheus/node_exporter#enabled-by-default)来感受一下。
+
+
+
+**第二种 Metrics，是来自于 Kubernetes 的 API Server、kubelet 等组件的 /metrics API**。除了常规的 CPU、内存的信息外，这部分信息还主要包括了各个组件的核心监控指标。比如，对于 API Server 来说，它就会在 /metrics API 里，暴露出各个 Controller 的工作队列（Work Queue）的长度、请求的 QPS 和延迟数据等等。这些信息，是检查 Kubernetes 本身工作情况的主要依据。
+
+
+
+**第三种 Metrics，是 Kubernetes 相关的监控数据。**这部分数据，一般叫作 Kubernetes 核心监控数据（core metrics）。这其中包括了 Pod、Node、容器、Service 等主要 Kubernetes 核心概念的 Metrics。
+
+
+
+其中，容器相关的 Metrics 主要来自于 kubelet 内置的 cAdvisor 服务。在 kubelet 启动后，cAdvisor 服务也随之启动，而它能够提供的信息，可以细化到每一个容器的 CPU 、文件系统、内存、网络等资源的使用情况。
+
+需要注意的是，这里提到的 Kubernetes 核心监控数据，其实使用的是 Kubernetes 的一个非常重要的扩展能力，叫作 Metrics Server。
+
+
+
+Metrics Server 在 Kubernetes 社区的定位，其实是用来取代 Heapster 这个项目的。在 Kubernetes 项目发展的初期，Heapster 是用户获取 Kubernetes 监控数据（比如 Pod 和 Node 的资源使用情况） 的主要渠道。而后面提出来的 Metrics Server，则把这些信息，通过标准的 Kubernetes API 暴露了出来。这样，Metrics 信息就跟 Heapster 完成了解耦，允许 Heapster 项目慢慢退出舞台。
+
+
+
+而有了 Metrics Server 之后，用户就可以通过标准的 Kubernetes API 来访问到这些监控数据了。比如，下面这个 URL：
+
+```
+http://127.0.0.1:8001/apis/metrics.k8s.io/v1beta1/namespaces/<namespace-name>/pods/<pod-name>
+```
+
+当你访问这个 Metrics API 时，它就会为你返回一个 Pod 的监控数据，而这些数据，其实是从 kubelet 的 Summary API （即 <kubelet_ip>:<kubelet_port>/stats/summary）采集而来的。Summary API 返回的信息，既包括了 cAdVisor 的监控数据，也包括了 kubelet 本身汇总的信息。
+
+需要指出的是， Metrics Server 并不是 kube-apiserver 的一部分，而是通过 Aggregator 这种插件机制，在独立部署的情况下同 kube-apiserver 一起统一对外服务的。
+
+
+
+这里，**Aggregator APIServer** 的工作原理，可以用如下所示的一幅示意图来表示清楚：
+
+<img src="深入剖析Kubernetes.assets/0b767b5224ad1906ddc4cce075618809.png" alt="img" style="zoom: 80%;" />
+
+
+
+> 备注：图片出处https://blog.jetstack.io/blog/resource-and-custom-metrics-hpa-v2/
+
+可以看到，当 Kubernetes 的 API Server 开启了 Aggregator 模式之后，你再访问 apis/metrics.k8s.io/v1beta1 的时候，实际上访问到的是一个叫作 kube-aggregator 的代理。而 kube-apiserver，正是这个代理的一个后端；而 Metrics Server，则是另一个后端。
+
+
+
+而且，在这个机制下，你还可以添加更多的后端给这个 kube-aggregator。所以 **kube-aggregator 其实就是一个根据 URL 选择具体的 API 后端的代理服务器。**通过这种方式，我们就可以很方便地扩展 Kubernetes 的 API 了。
+
+而 Aggregator 模式的开启也非常简单：
+
+
+如果你是使用 kubeadm 或者[官方的 kube-up.sh 脚本](https://github.com/kubernetes/kubernetes/blob/master/cluster/kube-up.sh)部署 Kubernetes 集群的话，Aggregator 模式就是默认开启的；
+
+如果是手动 DIY 搭建的话，你就需要在 kube-apiserver 的启动参数里加上如下所示的配置：
+
+```
+--requestheader-client-ca-file=<path to aggregator CA cert>
+--requestheader-allowed-names=front-proxy-client
+--requestheader-extra-headers-prefix=X-Remote-Extra-
+--requestheader-group-headers=X-Remote-Group
+--requestheader-username-headers=X-Remote-User
+--proxy-client-cert-file=<path to aggregator proxy cert>
+--proxy-client-key-file=<path to aggregator proxy key>
+```
+
+而这些配置的作用，主要就是为 Aggregator 这一层设置对应的 Key 和 Cert 文件。而这些文件的生成，就需要你自己手动完成了，具体流程请参考这篇[官方文档](https://github.com/kubernetes-incubator/apiserver-builder/blob/master/docs/concepts/auth.md)。
+
+Aggregator 功能开启之后，你只需要将 Metrics Server 的 YAML 文件部署起来，如下所示：
+
+```
+$ git clone https://github.com/kubernetes-incubator/metrics-server
+$ cd metrics-server
+$ kubectl create -f deploy/1.8+/
+```
+
+
+
+接下来，你就会看到 metrics.k8s.io 这个 API 出现在了你的 Kubernetes API 列表当中。
+
+在理解了 Prometheus 关心的三种监控数据源，以及 Kubernetes 的核心 Metrics 之后，作为用户，你其实要做的就是将 Prometheus Operator 在 Kubernetes 集群里部署起来。然后，按照本篇文章一开始介绍的架构，把上述 Metrics 源配置起来，让 Prometheus 自己去进行采集即可。
+
+在后续的文章中，我会为你进一步剖析 Kubernetes 监控体系以及自定义 Metrics （自定义监控指标）的具体技术点。
+
+
+
+### 总结
+
+在本篇文章中，我主要为你介绍了 Kubernetes 当前监控体系的设计，介绍了 Prometheus 项目在这套体系中的地位，讲解了以 Prometheus 为核心的监控系统的架构设计。
+
+然后，我为你详细地解读了 Kubernetes 核心监控数据的来源，即：Metrics Server 的具体工作原理，以及 Aggregator APIServer 的设计思路。
+
+通过以上讲述，我希望你能够对 Kubernetes 的监控体系形成一个整体的认知，体会到 Kubernetes 社区在监控这个事情上，全面以 Prometheus 项目为核心进行建设的大方向。
+
+
+
+最后，在具体的监控指标规划上，我建议你**遵循业界通用的 USE 原则和 RED 原则。**
+
+
+
+其中，USE 原则指的是，按照如下三个维度来规划资源监控指标：
+
+1. 利用率（Utilization），资源被有效利用起来提供服务的平均时间占比；
+2. 饱和度（Saturation），资源拥挤的程度，比如工作队列的长度；
+3. 错误率（Errors），错误的数量。
+
+
+
+而 RED 原则指的是，按照如下三个维度来规划服务监控指标：
+
+1. 每秒请求数量（Rate）；
+2. 每秒错误数量（Errors）；
+3. 服务响应时间（Duration）。
+
+
+
+不难发现， USE 原则主要关注的是“资源”，比如节点和容器的资源使用情况，而 RED 原则主要关注的是“服务”，比如 kube-apiserver 或者某个应用的工作情况。这两种指标，在我今天为你讲解的 Kubernetes + Prometheus 组成的监控体系中，都是可以完全覆盖到的。
+
+### 思考题
+
+在监控体系中，对于数据的采集，其实既有 Prometheus 这种 Pull 模式，也有 Push 模式。请问，你如何看待这两种模式的异同和优缺点呢？
+
+> chatGPT
+
+Pull 模式：
+
+- 异同：Pull 模式是由监控系统主动向被监控对象发送请求，获取数据。被监控对象只需提供一个接口供监控系统获取数据。
+- 优点：
+  - 灵活性高：监控系统可以根据需要选择获取哪些数据，可以动态调整采集频率。
+  - 节省资源：被监控对象只需提供数据接口，无需主动推送数据，减少了网络和计算资源的消耗。
+- 缺点：
+  - 延迟性：由于监控系统需要主动拉取数据，可能会存在一定的延迟，无法实时获取数据。
+  - 配置复杂：监控系统需要配置和管理每个被监控对象的数据采集接口。
+
+Push 模式：
+
+- 异同：Push 模式是被监控对象主动将数据推送给监控系统，监控系统只需提供一个接收数据的端点。
+- 优点：
+  - 实时性高：被监控对象主动推送数据，可以实现较低的延迟，监控系统可以及时获取数据。
+  - 简化配置：被监控对象只需配置推送数据的目标地址，无需关心监控系统的具体配置。
+- 缺点：
+  - 资源消耗：被监控对象需要主动推送数据，可能会增加网络和计算资源的消耗。
+  - 可扩展性：当被监控对象数量庞大时，管理和维护推送配置可能变得复杂。
+
+综合来看，Pull 模式适用于需要灵活性和资源节省的场景，可以根据需求选择采集的数据和频率。而 Push 模式适用于需要实时性和简化配置的场景，可以及时获取数据并减少被监控对象的配置工作。
+
+
+
+## 49 | Custom Metrics: 让Auto Scaling不再“食之无味”
+
+在上一篇文章中，我为你详细讲述了 Kubernetes 里的核心监控体系的架构。不难看到，Prometheus 项目在其中占据了最为核心的位置。
+
+实际上，借助上述监控体系，Kubernetes 就可以为你提供一种非常有用的能力，那就是 Custom Metrics，自定义监控指标。
+
+在过去的很多 PaaS 项目中，其实都有一种叫作 Auto Scaling，即自动水平扩展的功能。只不过，这个功能往往只能依据某种指定的资源类型执行水平扩展，比如 CPU 或者 Memory 的使用值。
+
+
+
+而在真实的场景中，用户需要进行 Auto Scaling 的依据往往是自定义的监控指标。比如，某个应用的等待队列的长度，或者某种应用相关资源的使用情况。这些复杂多变的需求，在传统 PaaS 项目和其他容器编排项目里，几乎是不可能轻松支持的。
+
+而凭借强大的 API 扩展机制，Custom Metrics 已经成为了 Kubernetes 的一项标准能力。并且，Kubernetes 的自动扩展器组件 Horizontal Pod Autoscaler （HPA）， 也可以直接使用 Custom Metrics 来执行用户指定的扩展策略，这里的整个过程都是非常灵活和可定制的。
+
+不难想到，Kubernetes 里的 Custom Metrics 机制，也是借助 Aggregator APIServer 扩展机制来实现的。这里的具体原理是，当你把 Custom Metrics APIServer 启动之后，Kubernetes 里就会出现一个叫作`custom.metrics.k8s.io`的 API。而当你访问这个 URL 时，Aggregator 就会把你的请求转发给 Custom Metrics APIServer 。
+
+
+
+而 Custom Metrics APIServer 的实现，其实就是一个 Prometheus 项目的 **Adaptor**。
+
+比如，现在我们要实现一个根据指定 Pod 收到的 HTTP 请求数量来进行 Auto Scaling 的 Custom Metrics，这个 Metrics 就可以通过访问如下所示的自定义监控 URL 获取到：
+
+```
+https://<apiserver_ip>/apis/custom-metrics.metrics.k8s.io/v1beta1/namespaces/default/pods/sample-metrics-app/http_requests 
+```
+
+
+
+这里的工作原理是，当你访问这个 URL 的时候，Custom Metrics APIServer 就会去 Prometheus 里查询名叫 sample-metrics-app 这个 Pod 的 http_requests 指标的值，然后按照固定的格式返回给访问者。
+
+当然，http_requests 指标的值，就需要由 Prometheus 按照我在上一篇文章中讲到的核心监控体系，从目标 Pod 上采集。
+
+这里具体的做法有很多种，最普遍的做法，就是让 Pod 里的应用本身暴露出一个 /metrics API，然后在这个 API 里返回自己收到的 HTTP 的请求的数量。所以说，接下来 HPA 只需要定时访问前面提到的自定义监控 URL，然后根据这些值计算是否要执行 Scaling 即可。
+
+
+
+接下来，我通过一个具体的实例，来为你讲解一下 Custom Metrics 具体的使用方式。这个实例的 GitHub 库[在这里](https://github.com/resouer/kubeadm-workshop)，你可以点击链接查看。在这个例子中，我依然会假设你的集群是 kubeadm 部署出来的，所以 Aggregator 功能已经默认开启了。
+
+> 备注：我们这里使用的实例，fork 自 Lucas 在上高中时做的一系列 Kubernetes 指南。
+
+
+
+**首先**，我们当然是先部署 Prometheus 项目。这一步，我当然会使用 Prometheus Operator 来完成，如下所示：
+
+```
+$ kubectl apply -f demos/monitoring/prometheus-operator.yaml
+clusterrole "prometheus-operator" created
+serviceaccount "prometheus-operator" created
+clusterrolebinding "prometheus-operator" created
+deployment "prometheus-operator" created
+
+$ kubectl apply -f demos/monitoring/sample-prometheus-instance.yaml
+clusterrole "prometheus" created
+serviceaccount "prometheus" created
+clusterrolebinding "prometheus" created
+prometheus "sample-metrics-prom" created
+service "sample-metrics-prom" created
+```
+
+**第二步**，我们需要把 Custom Metrics APIServer 部署起来，如下所示：
+
+```
+$ kubectl apply -f demos/monitoring/custom-metrics.yaml
+namespace "custom-metrics" created
+serviceaccount "custom-metrics-apiserver" created
+clusterrolebinding "custom-metrics:system:auth-delegator" created
+rolebinding "custom-metrics-auth-reader" created
+clusterrole "custom-metrics-read" created
+clusterrolebinding "custom-metrics-read" created
+deployment "custom-metrics-apiserver" created
+service "api" created
+apiservice "v1beta1.custom-metrics.metrics.k8s.io" created
+clusterrole "custom-metrics-server-resources" created
+clusterrolebinding "hpa-controller-custom-metrics" created
+
+```
+
+
+
+**第三步**，我们需要为 Custom Metrics APIServer 创建对应的 ClusterRoleBinding，以便能够使用 curl 来直接访问 Custom Metrics 的 API：
+
+```
+$ kubectl create clusterrolebinding allowall-cm --clusterrole custom-metrics-server-resources --user system:anonymous
+clusterrolebinding "allowall-cm" created
+```
+
+**第四步**，我们就可以把待监控的应用和 HPA 部署起来了，如下所示：
+
+```
+$ kubectl apply -f demos/monitoring/sample-metrics-app.yaml
+deployment "sample-metrics-app" created
+service "sample-metrics-app" created
+servicemonitor "sample-metrics-app" created
+horizontalpodautoscaler "sample-metrics-app-hpa" created
+ingress "sample-metrics-app" created
+
+```
+
+
+
+这里，我们需要关注一下 HPA 的配置，如下所示：
+
+```
+kind: HorizontalPodAutoscaler
+apiVersion: autoscaling/v2beta1
+metadata:
+  name: sample-metrics-app-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sample-metrics-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Object
+    object:
+      target:
+        kind: Service
+        name: sample-metrics-app
+      metricName: http_requests
+      targetValue: 100
+```
+
+可以看到，**HPA 的配置，就是你设置 Auto Scaling 规则的地方。**
+
+
+
+比如，scaleTargetRef 字段，就指定了被监控的对象是名叫 sample-metrics-app 的 Deployment，也就是我们上面部署的被监控应用。并且，它最小的实例数目是 2，最大是 10。
+
+在 metrics 字段，我们指定了这个 HPA 进行 Scale 的依据，是名叫 http_requests 的 Metrics。而获取这个 Metrics 的途径，则是访问名叫 sample-metrics-app 的 Service。
+
+有了这些字段里的定义， HPA 就可以向如下所示的 URL 发起请求来获取 Custom Metrics 的值了：
+
+```
+https://<apiserver_ip>/apis/custom-metrics.metrics.k8s.io/v1beta1/namespaces/default/services/sample-metrics-app/http_requests
+```
+
+需要注意的是，上述这个 URL 对应的被监控对象，是我们的应用对应的 Service。这跟本文一开始举例用到的 Pod 对应的 Custom Metrics URL 是不一样的。当然，**对于一个多实例应用来说，通过 Service 来采集 Pod 的 Custom Metrics 其实才是合理的做法。**
+
+
+
+这时候，我们可以通过一个名叫 **hey 的测试工具**来为我们的应用增加一些访问压力，具体做法如下所示：
+
+```
+$ # Install hey
+$ docker run -it -v /usr/local/bin:/go/bin golang:1.8 go get github.com/rakyll/hey
+
+$ export APP_ENDPOINT=$(kubectl get svc sample-metrics-app -o template --template {{.spec.clusterIP}}); echo ${APP_ENDPOINT}
+$ hey -n 50000 -c 1000 http://${APP_ENDPOINT}
+```
+
+与此同时，如果你去访问应用 Service 的 Custom Metircs URL，就会看到这个 URL 已经可以为你返回应用收到的 HTTP 请求数量了，如下所示：
+
+```
+$ curl -sSLk https://<apiserver_ip>/apis/custom-metrics.metrics.k8s.io/v1beta1/namespaces/default/services/sample-metrics-app/http_requests
+{
+  "kind": "MetricValueList",
+  "apiVersion": "custom-metrics.metrics.k8s.io/v1beta1",
+  "metadata": {
+    "selfLink": "/apis/custom-metrics.metrics.k8s.io/v1beta1/namespaces/default/services/sample-metrics-app/http_requests"
+  },
+  "items": [
+    {
+      "describedObject": {
+        "kind": "Service",
+        "name": "sample-metrics-app",
+        "apiVersion": "/__internal"
+      },
+      "metricName": "http_requests",
+      "timestamp": "2018-11-30T20:56:34Z",
+      "value": "501484m"
+    }
+  ]
+}
+```
+
+**这里需要注意的是，Custom Metrics API 为你返回的 Value 的格式。**
+
+
+
+在为被监控应用编写 /metrics API 的返回值时，我们其实比较容易计算的，是该 Pod 收到的 HTTP request 的总数。所以，我们这个[应用的代码](https://github.com/resouer/kubeadm-workshop/blob/master/images/autoscaling/server.js)其实是如下所示的样子：
+
+```
+  if (request.url == "/metrics") {
+    response.end("# HELP http_requests_total The amount of requests served by the server in total\n# TYPE http_requests_total counter\nhttp_requests_total " + totalrequests + "\n");
+    return;
+  }
+
+```
+
+可以看到，我们的应用在 /metrics 对应的 HTTP response 里返回的，其实是 http_requests_total 的值。这，也就是 Prometheus 收集到的值。
+
+
+
+而 Custom Metrics APIServer 在收到对 http_requests 指标的访问请求之后，它会从 Prometheus 里查询 http_requests_total 的值，然后把它折算成一个以时间为单位的请求率，最后把这个结果作为 http_requests 指标对应的值返回回去。
+
+
+
+所以说，我们在对前面的 Custom Metircs URL 进行访问时，会看到值是 501484m，这里的格式，其实就是 milli-requests，相当于是在过去两分钟内，每秒有 501 个请求。这样，应用的开发者就无需关心如何计算每秒的请求个数了。而这样的“请求率”的格式，是可以直接被 HPA 拿来使用的。
+
+
+
+这时候，如果你同时查看 Pod 的个数的话，就会看到 HPA 开始增加 Pod 的数目了。
+
+
+
+不过，在这里你可能会有一个疑问，Prometheus 项目，又是如何知道采集哪些 Pod 的 /metrics API 作为监控指标的来源呢。
+
+实际上，如果仔细观察一下我们前面创建应用的输出，你会看到有一个类型是 ServiceMonitor 的对象也被创建了出来。它的 YAML 文件如下所示：
+
+```
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: sample-metrics-app
+  labels:
+    service-monitor: sample-metrics-app
+spec:
+  selector:
+    matchLabels:
+      app: sample-metrics-app
+  endpoints:
+  - port: web
+
+```
+
+这个 ServiceMonitor 对象，正是 Prometheus Operator 项目用来指定被监控 Pod 的一个配置文件。可以看到，我其实是通过 Label Selector 为 Prometheus 来指定被监控应用的。
+
+### 总结
+
+在本篇文章中，我为你详细讲解了 Kubernetes 里对自定义监控指标，即 Custom Metrics 的设计与实现机制。这套机制的可扩展性非常强，也终于使得 Auto Scaling 在 Kubernetes 里面不再是一个“食之无味”的鸡肋功能了。
+
+
+
+另外可以看到，Kubernetes 的 Aggregator APIServer，是一个非常行之有效的 API 扩展机制。而且，Kubernetes 社区已经为你提供了一套叫作 [KubeBuilder](https://github.com/kubernetes-sigs/kubebuilder) 的工具库，帮助你生成一个 API Server 的完整代码框架，你只需要在里面添加自定义 API，以及对应的业务逻辑即可。
+
+
+
+### 思考题
+
+在你的业务场景中，你希望使用什么样的指标作为 Custom Metrics ，以便对 Pod 进行 Auto Scaling 呢？怎么获取到这个指标呢？
+
+> chatGPT
+
+以下是一些常见的指标和获取方法的示例：
+
+1. CPU 使用率：CPU 使用率是一个常见的指标，可以根据 CPU 的负载情况来自动扩缩容 Pod。可以使用容器运行时或云平台提供的监控工具来获取 CPU 使用率。
+2. 内存使用率：内存使用率是另一个重要的指标，可以根据内存的负载情况来自动扩缩容 Pod。类似地，可以使用监控工具来获取内存使用率。
+3. 请求响应时间：如果你的应用程序是一个 Web 服务或 API，可以使用请求响应时间作为指标。当请求响应时间超过某个阈值时，可以自动扩展 Pod 来处理更多的请求。可以使用应用程序日志或专门的性能监控工具来获取请求响应时间。
+4. 队列长度：如果你的应用程序涉及到消息队列或任务队列，可以使用队列长度作为指标。当队列长度超过一定阈值时，可以自动扩展 Pod 来处理积压的任务。可以通过监控队列的长度或使用队列服务提供的指标来获取这个指标。
+5. 自定义业务指标：根据你的具体业务需求，你还可以定义自己的自定义业务指标。例如，如果你的应用程序涉及到用户活跃度，你可以定义一个指标来衡量用户活跃度，并根据该指标自动扩缩容 Pod。
+
+获取这些指标的方法取决于你的应用程序和基础设施的架构。你可以使用监控工具、日志分析工具、指标收集器等来获取这些指标。云平台提供商通常也提供监控和指标服务，可以使用这些服务来获取和监控指标。
+
+
+
+
+
+## 50 | 让日志无处可逃：容器日志收集与管理
+
+
+
+在前面的文章中，我为你详细讲解了 Kubernetes 的核心监控体系和自定义监控体系的设计与实现思路。而在本篇文章里，我就来为你详细介绍一下 Kubernetes 里关于容器日志的处理方式。
+
+
+
+首先需要明确的是，Kubernetes 里面对容器日志的处理方式，都叫作 cluster-level-logging，即：这个日志处理系统，与容器、Pod 以及 Node 的生命周期都是完全无关的。这种设计当然是为了保证，无论是容器挂了、Pod 被删除，甚至节点宕机的时候，应用的日志依然可以被正常获取到。
+
+而对于一个容器来说，当应用把日志输出到 stdout 和 stderr 之后，容器项目在默认情况下就会把这些日志输出到宿主机上的一个 JSON 文件里。这样，你通过 kubectl logs 命令就可以看到这些容器的日志了。
+
+
+
+上述机制，就是我们今天要讲解的容器日志收集的基础假设。而如果你的应用是把文件输出到其他地方，比如直接输出到了容器里的某个文件里，或者输出到了远程存储里，那就属于特殊情况了。当然，我在文章里也会对这些特殊情况的处理方法进行讲述。
+
+
+
+而 Kubernetes 本身，实际上是不会为你做容器日志收集工作的，所以为了实现上述 cluster-level-logging，你需要在部署集群的时候，提前对具体的日志方案进行规划。而 Kubernetes 项目本身，主要为你推荐了三种日志方案。
+
+
+
+**第一种，在 Node 上部署 logging agent，将日志文件转发到后端存储里保存起来。**这个方案的架构图如下所示。
+
+<img src="深入剖析Kubernetes.assets/b5515aed076aa6af63ace55b62d36243.jpg" alt="img" style="zoom: 33%;" />
+
+
+
+不难看到，这里的核心就在于 logging agent ，它一般都会以 DaemonSet 的方式运行在节点上，然后将宿主机上的容器日志目录挂载进去，最后由 logging-agent 把日志转发出去。
+
+
+
+举个例子，我们可以通过 Fluentd 项目作为宿主机上的 logging-agent，然后把日志转发到远端的 ElasticSearch 里保存起来供将来进行检索。具体的操作过程，你可以通过阅读[这篇文档](https://kubernetes.io/docs/user-guide/logging/elasticsearch)来了解。另外，在很多 Kubernetes 的部署里，会自动为你启用 [logrotate](https://linux.die.net/man/8/logrotate)，在日志文件超过 10MB 的时候自动对日志文件进行 rotate 操作。
+
+
+
+可以看到，在 Node 上部署 logging agent 最大的优点，在于一个节点只需要部署一个 agent，并且不会对应用和 Pod 有任何侵入性。所以，这个方案，在社区里是最常用的一种。
+
+但是也不难看到，这种方案的不足之处就在于，它要求应用输出的日志，都必须是直接输出到容器的 stdout 和 stderr 里。
+
+
+
+所以，**Kubernetes 容器日志方案的第二种，就是对这种特殊情况的一个处理，即：当容器的日志只能输出到某些文件里的时候，我们可以通过一个 sidecar 容器把这些日志文件重新输出到 sidecar 的 stdout 和 stderr 上，这样就能够继续使用第一种方案了。**这个方案的具体工作原理，如下所示。
+
+<img src="深入剖析Kubernetes.assets/4863e3d7d1ef02a5a44e431369ac4120.jpg" alt="img" style="zoom: 33%;" />
+
+比如，现在我的应用 Pod 只有一个容器，它会把日志输出到容器里的 /var/log/1.log 和 2.log 这两个文件里。这个 Pod 的 YAML 文件如下所示：
+
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: counter
+spec:
+  containers:
+  - name: count
+    image: busybox
+    args:
+    - /bin/sh
+    - -c
+    - >
+      i=0;
+      while true;
+      do
+        echo "$i: $(date)" >> /var/log/1.log;
+        echo "$(date) INFO $i" >> /var/log/2.log;
+        i=$((i+1));
+        sleep 1;
+      done
+    volumeMounts:
+    - name: varlog
+      mountPath: /var/log
+  volumes:
+  - name: varlog
+    emptyDir: {}
+
+```
+
+在这种情况下，你用 kubectl logs 命令是看不到应用的任何日志的。而且我们前面讲解的、最常用的方案一，也是没办法使用的。
+
+
+
+那么这个时候，我们就可以为这个 Pod 添加两个 sidecar 容器，分别将上述两个日志文件里的内容重新以 stdout 和 stderr 的方式输出出来，这个 YAML 文件的写法如下所示：
+
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: counter
+spec:
+  containers:
+  - name: count
+    image: busybox
+    args:
+    - /bin/sh
+    - -c
+    - >
+      i=0;
+      while true;
+      do
+        echo "$i: $(date)" >> /var/log/1.log;
+        echo "$(date) INFO $i" >> /var/log/2.log;
+        i=$((i+1));
+        sleep 1;
+      done
+    volumeMounts:
+    - name: varlog
+      mountPath: /var/log
+  - name: count-log-1
+    image: busybox
+    args: [/bin/sh, -c, 'tail -n+1 -f /var/log/1.log']
+    volumeMounts:
+    - name: varlog
+      mountPath: /var/log
+  - name: count-log-2
+    image: busybox
+    args: [/bin/sh, -c, 'tail -n+1 -f /var/log/2.log']
+    volumeMounts:
+    - name: varlog
+      mountPath: /var/log
+  volumes:
+  - name: varlog
+    emptyDir: {}
+
+```
+
+这时候，你就可以通过 kubectl logs 命令查看这两个 sidecar 容器的日志，间接看到应用的日志内容了，如下所示：
+
+```
+$ kubectl logs counter count-log-1
+0: Mon Jan 1 00:00:00 UTC 2001
+1: Mon Jan 1 00:00:01 UTC 2001
+2: Mon Jan 1 00:00:02 UTC 2001
+...
+$ kubectl logs counter count-log-2
+Mon Jan 1 00:00:00 UTC 2001 INFO 0
+Mon Jan 1 00:00:01 UTC 2001 INFO 1
+Mon Jan 1 00:00:02 UTC 2001 INFO 2
+...
+```
+
+
+
+由于 sidecar 跟主容器之间是共享 Volume 的，所以这里的 sidecar 方案的额外性能损耗并不高，也就是多占用一点 CPU 和内存罢了。
+
+但需要注意的是，这时候，宿主机上实际上会存在两份相同的日志文件：一份是应用自己写入的；另一份则是 sidecar 的 stdout 和 stderr 对应的 JSON 文件。这对磁盘是很大的浪费。
+
+所以说，除非万不得已或者应用容器完全不可能被修改，否则我还是建议你直接使用方案一，或者直接使用下面的第三种方案。
+
+
+
+**第三种方案，就是通过一个 sidecar 容器，直接把应用的日志文件发送到远程存储里面去。**也就是相当于把方案一里的 logging agent，放在了应用 Pod 里。这种方案的架构如下所示：
+
+<img src="深入剖析Kubernetes.assets/d464401baec60c11f96dfeea3ae3a9c7.jpg" alt="img" style="zoom:33%;" />
+
+在这种方案里，你的应用还可以直接把日志输出到固定的文件里而不是 stdout，你的 logging-agent 还可以使用 fluentd，后端存储还可以是 ElasticSearch。只不过， fluentd 的输入源，变成了应用的日志文件。一般来说，我们会把 fluentd 的输入源配置保存在一个 ConfigMap 里，如下所示：
+
+```
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluentd-config
+data:
+  fluentd.conf: |
+    <source>
+      type tail
+      format none
+      path /var/log/1.log
+      pos_file /var/log/1.log.pos
+      tag count.format1
+    </source>
+    
+    <source>
+      type tail
+      format none
+      path /var/log/2.log
+      pos_file /var/log/2.log.pos
+      tag count.format2
+    </source>
+    
+    <match **>
+      type google_cloud
+    </match>
+
+```
+
+然后，我们在应用 Pod 的定义里，就可以声明一个 Fluentd 容器作为 sidecar，专门负责将应用生成的 1.log 和 2.log 转发到 ElasticSearch 当中。这个配置，如下所示：
+
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: counter
+spec:
+  containers:
+  - name: count
+    image: busybox
+    args:
+    - /bin/sh
+    - -c
+    - >
+      i=0;
+      while true;
+      do
+        echo "$i: $(date)" >> /var/log/1.log;
+        echo "$(date) INFO $i" >> /var/log/2.log;
+        i=$((i+1));
+        sleep 1;
+      done
+    volumeMounts:
+    - name: varlog
+      mountPath: /var/log
+  - name: count-agent
+    image: k8s.gcr.io/fluentd-gcp:1.30
+    env:
+    - name: FLUENTD_ARGS
+      value: -c /etc/fluentd-config/fluentd.conf
+    volumeMounts:
+    - name: varlog
+      mountPath: /var/log
+    - name: config-volume
+      mountPath: /etc/fluentd-config
+  volumes:
+  - name: varlog
+    emptyDir: {}
+  - name: config-volume
+    configMap:
+      name: fluentd-config
+
+```
+
+
+
+可以看到，这个 Fluentd 容器使用的输入源，就是通过引用我们前面编写的 ConfigMap 来指定的。这里我用到了 Projected Volume 来把 ConfigMap 挂载到 Pod 里。如果你对这个用法不熟悉的话，可以再回顾下第 15 篇文章[《 深入解析 Pod 对象（二）：使用进阶》](https://time.geekbang.org/column/article/40466)中的相关内容。
+
+
+
+需要注意的是，这种方案虽然部署简单，并且对宿主机非常友好，但是这个 sidecar 容器很可能会消耗较多的资源，甚至拖垮应用容器。并且，由于日志还是没有输出到 stdout 上，所以你通过 kubectl logs 是看不到任何日志输出的。
+
+以上，就是 Kubernetes 项目对容器应用日志进行管理最常用的三种手段了。
+
+
+
+### 总结
+
+在本篇文章中，我为你详细讲解了 Kubernetes 项目对容器应用日志的收集方式。
+
+综合对比以上三种方案，我比较建议你将应用日志输出到 stdout 和 stderr，然后通过在宿主机上部署 logging-agent 的方式来集中处理日志。
+
+这种方案不仅管理简单，kubectl logs 也可以用，而且可靠性高，并且宿主机本身，很可能就自带了 rsyslogd 等非常成熟的日志收集组件来供你使用。
+
+
+
+除此之外，还有一种方式就是在编写应用的时候，就直接指定好日志的存储后端，如下所示：
+
+<img src="深入剖析Kubernetes.assets/13e8439d9945fea58c9672fc4ca30799.jpg" alt="img" style="zoom:33%;" />
+
+在这种方案下，Kubernetes 就完全不必操心容器日志的收集了，这对于本身已经有完善的日志处理系统的公司来说，是一个非常好的选择。
+
+
+
+最后需要指出的是，无论是哪种方案，你都必须要及时将这些日志文件从宿主机上清理掉，或者给日志目录专门挂载一些容量巨大的远程盘。否则，一旦主磁盘分区被打满，整个系统就可能会陷入崩溃状态，这是非常麻烦的。
+
+
+
+### 思考题
+
+1. 请问，当日志量很大的时候，直接将日志输出到容器 stdout 和 stderr 上，有没有什么隐患呢？有没有解决办法呢？
+2. 你还有哪些容器收集的方案，是否可以分享一下？
+
+> chatGPT
+
+当日志量很大时，直接将日志输出到容器的 stdout 和 stderr 上可能会导致一些隐患，包括：
+
+1. 容器日志溢出：如果日志量非常大，容器的 stdout 和 stderr 可能会被填满，导致日志溢出。这可能会导致日志丢失或容器无法正常工作。
+2. 性能影响：大量的日志输出可能会对容器的性能产生负面影响，包括增加磁盘 I/O、网络传输和日志处理的负载。
+
+为了解决这些问题，可以采用以下一些解决办法：
+
+1. 使用日志收集器：将日志发送到专门的日志收集器，如 Elasticsearch、Fluentd、Logstash、Splunk 等。这些工具可以处理大量的日志数据，并提供搜索、过滤、聚合和可视化等功能。
+2. 日志切割和归档：配置日志切割和归档策略，将日志按照一定的大小或时间进行切割，并将旧的日志归档到其他存储介质，以避免日志溢出和性能问题。
+3. 使用日志转发器：将容器的日志转发到专门的日志服务器或云平台提供的日志服务。这些服务通常具有弹性和可扩展性，可以处理大量的日志数据，并提供日志存储、搜索和分析功能。
+4. 日志级别控制：在容器中控制日志的级别，只输出必要的日志信息，避免产生过多的冗余日志。
+
+关于容器日志收集的方案，以下是一些常见的方案：
+
+- 使用容器日志驱动：Docker 提供了多种日志驱动，如 json-file、syslog、fluentd 等，可以将容器日志直接发送到指定的目标。
+- 使用日志收集器：如前面提到的 Elasticsearch、Fluentd、Logstash、Splunk 等工具，可以通过配置将容器日志发送到这些收集器进行集中管理和分析。
+- 使用云平台提供的日志服务：云平台（如 AWS CloudWatch Logs、Google Cloud Logging、Azure Monitor）通常提供了集成的日志服务，可以直接将容器日志发送到这些服务中。
+
+这些方案可以根据具体需求和架构选择合适的方式来收集和处理容器日志。
+
+
+
+
+
+
 
 
 
