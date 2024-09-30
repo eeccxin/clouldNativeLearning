@@ -7101,9 +7101,1034 @@ volumeBindingMode: WaitForFirstConsumer
 
 ## 30 | 编写自己的存储插件：FlexVolume与CSI
 
+在上一篇文章中，我为你详细介绍了 Kubernetes 里的持久化存储体系，讲解了 PV 和 PVC 的具体实现原理，并提到了这样的设计实际上是出于对整个存储体系的可扩展性的考虑。
+
+
+
+而在今天这篇文章中，我就和你分享一下如何借助这些机制，来开发自己的存储插件。
+
+在 Kubernetes 中，存储插件的开发有两种方式：FlexVolume 和 CSI。
+
+
+
+### FlexVolume
+
+接下来，我就先为你剖析一下 Flexvolume 的原理和使用方法。
+
+举个例子，现在我们要编写的是一个使用 NFS 实现的 FlexVolume 插件。
+
+
+
+对于一个 FlexVolume 类型的 PV 来说，它的 YAML 文件如下所示：
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-flex-nfs
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteMany
+  flexVolume:
+    driver: "k8s/nfs"
+    fsType: "nfs"
+    options:
+      server: "10.10.0.25" # 改成你自己的NFS服务器地址
+      share: "export"
+
+```
+
+可以看到，这个 PV 定义的 Volume 类型是 flexVolume。并且，我们**指定了这个 Volume 的 driver 叫作 k8s/nfs**。这个名字很重要，我后面马上会为你解释它的含义。
+
+而 Volume 的 options 字段，则是一个自定义字段。也就是说，它的类型，其实是 map[string]string。所以，你可以在这一部分自由地加上你想要定义的参数。
+
+在我们这个例子里，options 字段指定了 NFS 服务器的地址（server: “10.10.0.25”），以及 NFS 共享目录的名字（share: “export”）。当然，你这里定义的所有参数，后面都会被 FlexVolume 拿到。
+
+> 备注：你可以使用[这个 Docker 镜像](https://github.com/ehough/docker-nfs-server)轻松地部署一个试验用的 NFS 服务器。
+
+像这样的一个 PV 被创建后，一旦和某个 PVC 绑定起来，这个 FlexVolume 类型的 Volume 就会进入到我们前面讲解过的 Volume 处理流程。
+
+你应该还记得，这个流程的名字叫作“两阶段处理”，即“Attach 阶段”和“Mount 阶段”。它们的主要作用，是在 Pod 所绑定的宿主机上，完成这个 Volume 目录的持久化过程，比如为虚拟机挂载磁盘（Attach），或者挂载一个 NFS 的共享目录（Mount）。
+
+> 备注：你可以再回顾一下第 28 篇文章[《PV、PVC、StorageClass，这些到底在说啥？》](https://time.geekbang.org/column/article/42698)中的相关内容。
+
+
+
+而在具体的控制循环中，这两个操作实际上调用的，正是 Kubernetes 的 pkg/volume 目录下的存储插件（Volume Plugin）。在我们这个例子里，就是 pkg/volume/flexvolume 这个目录里的代码。
+
+
+
+当然了，这个目录其实只是 FlexVolume 插件的入口。以“Mount 阶段”为例，在 FlexVolume 目录里，它的处理过程非常简单，如下所示：
+
+```go
+// SetUpAt creates new directory.
+func (f *flexVolumeMounter) SetUpAt(dir string, fsGroup *int64) error {
+  ...
+  call := f.plugin.NewDriverCall(mountCmd)
+  
+  // Interface parameters
+  call.Append(dir)
+  
+  extraOptions := make(map[string]string)
+  
+  // pod metadata
+  extraOptions[optionKeyPodName] = f.podName
+  extraOptions[optionKeyPodNamespace] = f.podNamespace
+  
+  ...
+  
+  call.AppendSpec(f.spec, f.plugin.host, extraOptions)
+  
+  _, err = call.Run()
+  
+  ...
+  
+  return nil
+}
+```
+
+上面这个名叫 SetUpAt() 的方法，正是 FlexVolume 插件对“Mount 阶段”的实现位置。而 SetUpAt() 实际上只做了一件事，那就是封装出了一行命令（即：NewDriverCall），由 kubelet 在“Mount 阶段”去执行。
+
+
+
+在我们这个例子中，**kubelet 要通过插件在宿主机上执行的命令，如下所示**：
+
+```
+/usr/libexec/kubernetes/kubelet-plugins/volume/exec/k8s~nfs/nfs mount <mount dir> <json param>
+```
+
+其中，/usr/libexec/kubernetes/kubelet-plugins/volume/exec/k8s~nfs/nfs 就是插件的可执行文件的路径。这个名叫 nfs 的文件，正是你要编写的插件的实现。它可以是一个二进制文件，也可以是一个脚本。总之，只要能在宿主机上被执行起来即可。
+
+
+
+而且这个路径里的 k8s~nfs 部分，正是这个插件在 Kubernetes 里的名字。它是从 driver="k8s/nfs"字段解析出来的。
+
+
+
+这个 driver 字段的格式是：vendor/driver。比如，一家存储插件的提供商（vendor）的名字叫作 k8s，提供的存储驱动（driver）是 nfs，那么 Kubernetes 就会使用 k8s~nfs 来作为插件名。
+
+
+
+所以说，**当你编写完了 FlexVolume 的实现之后，一定要把它的可执行文件放在每个节点的插件目录下。**
+
+而紧跟在可执行文件后面的“mount”参数，定义的就是当前的操作。在 FlexVolume 里，这些操作参数的名字是固定的，比如 init、mount、unmount、attach，以及 dettach 等等，分别对应不同的 Volume 处理操作。
+
+
+
+而跟在 mount 参数后面的两个字段：`<mount dir>`和`<json params>`，则是 FlexVolume 必须提供给这条命令的两个执行参数。
+
+
+
+其中第一个执行参数`<mount dir>`，正是 kubelet 调用 SetUpAt() 方法传递来的 dir 的值。它代表的是当前正在处理的 Volume 在宿主机上的目录。在我们的例子里，这个路径如下所示：
+
+```
+/var/lib/kubelet/pods/<Pod ID>/volumes/k8s~nfs/test
+```
+
+其中，test 正是我们前面定义的 PV 的名字；而 k8s~nfs，则是插件的名字。可以看到，插件的名字正是从你声明的 driver="k8s/nfs"字段里解析出来的。
+
+
+
+而第二个执行参数`<json params>`，则是一个 JSON Map 格式的参数列表。我们在前面 PV 里定义的 options 字段的值，都会被追加在这个参数里。此外，在 SetUpAt() 方法里可以看到，这个参数列表里还包括了 Pod 的名字、Namespace 等元数据（Metadata）。
+
+
+
+在明白了存储插件的调用方式和参数列表之后，这个插件的可执行文件的实现部分就非常容易理解了。
+
+
+
+在这个例子中，我直接编写了一个简单的 shell 脚本来作为插件的实现，它对“Mount 阶段”的处理过程，如下所示：
+
+```
+domount() {
+ MNTPATH=$1
+ 
+ NFS_SERVER=$(echo $2 | jq -r '.server')
+ SHARE=$(echo $2 | jq -r '.share')
+ 
+ ...
+ 
+ mkdir -p ${MNTPATH} &> /dev/null
+ 
+ mount -t nfs ${NFS_SERVER}:/${SHARE} ${MNTPATH} &> /dev/null
+ if [ $? -ne 0 ]; then
+  err "{ \"status\": \"Failure\", \"message\": \"Failed to mount ${NFS_SERVER}:${SHARE} at ${MNTPATH}\"}"
+  exit 1
+ fi
+ log '{"status": "Success"}'
+ exit 0
+}
+```
+
+可以看到，当 kubelet 在宿主机上执行“`nfs mount <mount dir> <json params>`”的时候，这个名叫 nfs 的脚本，就可以直接从`<mount dir>`参数里拿到 Volume 在宿主机上的目录，即：`MNTPATH=$1`。而你在 PV 的 options 字段里定义的 NFS 的服务器地址（options.server）和共享目录名字（options.share），则可以从第二个`<json params>`参数里解析出来。这里，我们使用了 jq 命令，来进行解析工作。
+
+
+
+有了这三个参数之后，这个脚本最关键的一步，当然就是执行：`mount -t nfs ${NFS_SERVER}:/${SHARE} ${MNTPATH}` 。这样，一个 NFS 的数据卷就被挂载到了 MNTPATH，也就是 Volume 所在的宿主机目录上，一个持久化的 Volume 目录就处理完了。
+
+
+
+需要注意的是，当这个 mount -t nfs 操作完成后，你必须把一个 JOSN 格式的字符串，比如：{“status”: “Success”}，返回给调用者，也就是 kubelet。这是 kubelet 判断这次调用是否成功的唯一依据。
+
+
+
+综上所述，在“Mount 阶段”，kubelet 的 VolumeManagerReconcile 控制循环里的一次“调谐”操作的执行流程，如下所示：
+
+```
+kubelet --> pkg/volume/flexvolume.SetUpAt() --> /usr/libexec/kubernetes/kubelet-plugins/volume/exec/k8s~nfs/nfs mount <mount dir> <json param>
+```
+
+
+
+> 
+> 备注：这个 NFS 的 FlexVolume 的完整实现，在[这个 GitHub 库](https://github.com/kubernetes/examples/blob/master/staging/volumes/flexvolume/nfs)里。而你如果想用 Go 语言编写 FlexVolume 的话，我也有一个[很好的例子](https://github.com/kubernetes/frakti/tree/master/pkg/flexvolume)供你参考。
+
+
+
+当然，在前面文章中我也提到过，像 NFS 这样的文件系统存储，并不需要在宿主机上挂载磁盘或者块设备。所以，我们也就不需要实现 attach 和 dettach 操作了。
+
+
+
+不过，**像这样的 FlexVolume 实现方式，虽然简单，但局限性却很大。**
+
+
+
+比如，跟 Kubernetes 内置的 NFS 插件类似，这个 NFS FlexVolume 插件，也不能支持 Dynamic Provisioning（即：为每个 PVC 自动创建 PV 和对应的 Volume）。除非你再为它编写一个专门的 External Provisioner。
+
+
+
+再比如，我的插件在执行 mount 操作的时候，可能会生成一些挂载信息。这些信息，在后面执行 unmount 操作的时候会被用到。可是，在上述 FlexVolume 的实现里，你没办法把这些信息保存在一个变量里，等到 unmount 的时候直接使用。
+
+
+
+这个原因也很容易理解：**FlexVolume 每一次对插件可执行文件的调用，都是一次完全独立的操作**。所以，我们只能把这些信息写在一个宿主机上的临时文件里，等到 unmount 的时候再去读取。
+
+这也是为什么，我们需要有 Container Storage Interface（CSI）这样更完善、更编程友好的插件方式。
+
+### CSI
+
+接下来，我就来为你讲解一下开发存储插件的第二种方式 CSI。我们先来看一下 CSI 插件体系的设计原理。
+
+
+
+其实，通过前面对 FlexVolume 的讲述，你应该可以明白，默认情况下，Kubernetes 里通过存储插件管理容器持久化存储的原理，可以用如下所示的示意图来描述：
+
+<img src="深入剖析Kubernetes.assets/6a553321623f6b58f5494b25091592ef.png" alt="img" style="zoom:50%;" />
+
+可以看到，在上述体系下，无论是 FlexVolume，还是 Kubernetes 内置的其他存储插件，它们实际上担任的角色，仅仅是 Volume 管理中的“Attach 阶段”和“Mount 阶段”的具体执行者。而像 Dynamic Provisioning 这样的功能，就不是存储插件的责任，而是 Kubernetes 本身存储管理功能的一部分。
+
+
+
+相比之下，**CSI 插件体系的设计思想，就是把这个 Provision 阶段，以及 Kubernetes 里的一部分存储管理功能，从主干代码里剥离出来，做成了几个单独的组件**。这些组件会通过 Watch API 监听 Kubernetes 里与存储相关的事件变化，比如 PVC 的创建，来执行具体的存储管理动作。
+
+
+
+而这些管理动作，比如“Attach 阶段”和“Mount 阶段”的具体操作，实际上就是通过调用 CSI 插件来完成的。
+
+
+
+这种设计思路，我可以用如下所示的一幅示意图来表示：
+
+<img src="深入剖析Kubernetes.assets/d4bdc7035f1286e7a423da851eee89ad.png" alt="img" style="zoom:50%;" />
+
+
+
+可以看到，这套存储插件体系多了三个独立的外部组件（External Components），即：Driver Registrar、External Provisioner 和 External Attacher，对应的正是从 Kubernetes 项目里面剥离出来的那部分存储管理功能。
+
+
+
+需要注意的是，External Components 虽然是外部组件，但依然由 Kubernetes 社区来开发和维护。
+
+
+
+而图中最右侧的部分，就是需要我们编写代码来实现的 CSI 插件。一个 CSI 插件只有一个二进制文件，但它会以 gRPC 的方式对外提供三个服务（gRPC Service），分别叫作：CSI Identity、CSI Controller 和 CSI Node。
+
+
+
+我先来为你讲解一下这三个 External Components。
+
+
+
+其中，**Driver Registrar 组件，负责将插件注册到 kubelet 里面**（这可以类比为，将可执行文件放在插件目录下）。而在具体实现上，Driver Registrar 需要请求 CSI 插件的 Identity 服务来获取插件信息。
+
+
+
+而 **External Provisioner 组件，负责的正是 Provision 阶段**。在具体实现上，External Provisioner 监听（Watch）了 APIServer 里的 PVC 对象。当一个 PVC 被创建时，它就会调用 CSI Controller 的 CreateVolume 方法，为你创建对应 PV。
+
+
+
+此外，如果你使用的存储是公有云提供的磁盘（或者块设备）的话，这一步就需要调用公有云（或者块设备服务）的 API 来创建这个 PV 所描述的磁盘（或者块设备）了。
+
+
+
+不过，由于 CSI 插件是独立于 Kubernetes 之外的，所以在 CSI 的 API 里不会直接使用 Kubernetes 定义的 PV 类型，而是会自己定义一个单独的 Volume 类型。
+
+
+
+**为了方便叙述，在本专栏里，我会把 Kubernetes 里的持久化卷类型叫作 PV，把 CSI 里的持久化卷类型叫作 CSI Volume，请你务必区分清楚。**
+
+
+
+最后一个 **External Attacher 组件，负责的正是“Attach 阶段”**。在具体实现上，它监听了 APIServer 里 VolumeAttachment 对象的变化。VolumeAttachment 对象是 Kubernetes 确认一个 Volume 可以进入“Attach 阶段”的重要标志，我会在下一篇文章里为你详细讲解。
+
+
+
+一旦出现了 VolumeAttachment 对象，External Attacher 就会调用 CSI Controller 服务的 ControllerPublish 方法，完成它所对应的 Volume 的 Attach 阶段。
+
+
+
+而 Volume 的“Mount 阶段”，并不属于 External Components 的职责。当 kubelet 的 VolumeManagerReconciler 控制循环检查到它需要执行 Mount 操作的时候，会通过 pkg/volume/csi 包，直接调用 CSI Node 服务完成 Volume 的“Mount 阶段”。
+
+
+
+在实际使用 CSI 插件的时候，我们会将这三个 External Components 作为 sidecar 容器和 CSI 插件放置在同一个 Pod 中。由于 External Components 对 CSI 插件的调用非常频繁，所以这种 sidecar 的部署方式非常高效。
+
+
+
+接下来，我再为你讲解一下 CSI 插件的里三个服务：CSI Identity、CSI Controller 和 CSI Node。
+
+
+
+其中，**CSI 插件的 CSI Identity 服务，负责对外暴露这个插件本身的信息**，如下所示：
+
+```
+service Identity {
+  // return the version and name of the plugin
+  rpc GetPluginInfo(GetPluginInfoRequest)
+    returns (GetPluginInfoResponse) {}
+  // reports whether the plugin has the ability of serving the Controller interface
+  rpc GetPluginCapabilities(GetPluginCapabilitiesRequest)
+    returns (GetPluginCapabilitiesResponse) {}
+  // called by the CO just to check whether the plugin is running or not
+  rpc Probe (ProbeRequest)
+    returns (ProbeResponse) {}
+}
+
+```
+
+而 **CSI Controller 服务，定义的则是对 CSI Volume（对应 Kubernetes 里的 PV）的管理接口**，比如：创建和删除 CSI Volume、对 CSI Volume 进行 Attach/Dettach（在 CSI 里，这个操作被叫作 Publish/Unpublish），以及对 CSI Volume 进行 Snapshot 等，它们的接口定义如下所示：
+
+```
+service Controller {
+  // provisions a volume
+  rpc CreateVolume (CreateVolumeRequest)
+    returns (CreateVolumeResponse) {}
+    
+  // deletes a previously provisioned volume
+  rpc DeleteVolume (DeleteVolumeRequest)
+    returns (DeleteVolumeResponse) {}
+    
+  // make a volume available on some required node
+  rpc ControllerPublishVolume (ControllerPublishVolumeRequest)
+    returns (ControllerPublishVolumeResponse) {}
+    
+  // make a volume un-available on some required node
+  rpc ControllerUnpublishVolume (ControllerUnpublishVolumeRequest)
+    returns (ControllerUnpublishVolumeResponse) {}
+    
+  ...
+  
+  // make a snapshot
+  rpc CreateSnapshot (CreateSnapshotRequest)
+    returns (CreateSnapshotResponse) {}
+    
+  // Delete a given snapshot
+  rpc DeleteSnapshot (DeleteSnapshotRequest)
+    returns (DeleteSnapshotResponse) {}
+    
+  ...
+}
+
+```
+
+不难发现，CSI Controller 服务里定义的这些操作有个共同特点，那就是它们都无需在宿主机上进行，而是属于 Kubernetes 里 Volume Controller 的逻辑，也就是属于 Master 节点的一部分。
+
+
+
+需要注意的是，正如我在前面提到的那样，CSI Controller 服务的实际调用者，并不是 Kubernetes（即：通过 pkg/volume/csi 发起 CSI 请求），而是 External Provisioner 和 External Attacher。这两个 External Components，分别通过监听 PVC 和 VolumeAttachement 对象，来跟 Kubernetes 进行协作。
+
+
+
+而 CSI Volume 需要在宿主机上执行的操作，都定义在了 CSI Node 服务里面，如下所示：
+
+```
+service Node {
+  // temporarily mount the volume to a staging path
+  rpc NodeStageVolume (NodeStageVolumeRequest)
+    returns (NodeStageVolumeResponse) {}
+    
+  // unmount the volume from staging path
+  rpc NodeUnstageVolume (NodeUnstageVolumeRequest)
+    returns (NodeUnstageVolumeResponse) {}
+    
+  // mount the volume from staging to target path
+  rpc NodePublishVolume (NodePublishVolumeRequest)
+    returns (NodePublishVolumeResponse) {}
+    
+  // unmount the volume from staging path
+  rpc NodeUnpublishVolume (NodeUnpublishVolumeRequest)
+    returns (NodeUnpublishVolumeResponse) {}
+    
+  // stats for the volume
+  rpc NodeGetVolumeStats (NodeGetVolumeStatsRequest)
+    returns (NodeGetVolumeStatsResponse) {}
+    
+  ...
+  
+  // Similar to NodeGetId
+  rpc NodeGetInfo (NodeGetInfoRequest)
+    returns (NodeGetInfoResponse) {}
+}
+
+```
+
+需要注意的是，“Mount 阶段”在 CSI Node 里的接口，是由 NodeStageVolume 和 NodePublishVolume 两个接口共同实现的。我会在下一篇文章中，为你详细介绍这个设计的目的和具体的实现方式。
+
+
+
+### 总结
+
+在本篇文章里，我为你详细讲解了 FlexVolume 和 CSI 这两种自定义存储插件的工作原理。
+
+
+
+可以看到，相比于 FlexVolume，CSI 的设计思想，把插件的职责从“两阶段处理”，扩展成了 Provision、Attach 和 Mount 三个阶段。其中，Provision 等价于“创建磁盘”，Attach 等价于“挂载磁盘到虚拟机”，Mount 等价于“将该磁盘格式化后，挂载在 Volume 的宿主机目录上”。
+
+
+
+在有了 CSI 插件之后，Kubernetes 本身依然按照我在第 28 篇文章[《PV、PVC、StorageClass，这些到底在说啥？》](https://time.geekbang.org/column/article/42698)中所讲述的方式工作，唯一区别在于：
+
+
+
+- 当 AttachDetachController 需要进行“Attach”操作时（“Attach 阶段”），它实际上会执行到 pkg/volume/csi 目录中，创建一个 VolumeAttachment 对象，从而触发 External Attacher 调用 CSI Controller 服务的 ControllerPublishVolume 方法。
+- 当 VolumeManagerReconciler 需要进行“Mount”操作时（“Mount 阶段”），它实际上也会执行到 pkg/volume/csi 目录中，直接向 CSI Node 服务发起调用 NodePublishVolume 方法的请求。
+
+以上，就是 CSI 插件最基本的工作原理了。
+
+### 思考题
+
+假设现在，你的宿主机是阿里云的一台虚拟机，你要实现的容器持久化存储，是基于阿里云提供的云盘。你能准确地描述出，在 Provision、Attach 和 Mount 阶段，CSI 插件都需要做哪些操作吗？
+
+> chatGPT
+
+在使用阿里云云盘作为容器持久化存储时，CSI（Container Storage Interface）插件在 Provision、Attach 和 Mount 阶段需要执行以下操作：
+
+1. Provision 阶段：
+   - CSI 插件通过调用阿里云云盘的 API 创建一个新的云盘卷（Volume）。
+   - 插件将返回的卷信息（如卷 ID、大小等）保存在 Kubernetes 中的持久卷（Persistent Volume）对象中。
+2. Attach 阶段：
+   - CSI 插件通过调用阿里云云盘的 API 将云盘卷附加到宿主机上。
+   - 插件将返回的设备路径（如 `/dev/xvdb`）保存在 Kubernetes 中的持久卷声明（Persistent Volume Claim）对象中。
+3. Mount 阶段：
+   - CSI 插件通过调用宿主机的挂载命令（如 `mount`）将设备路径挂载到容器的指定挂载点上。
+   - 插件将挂载点和其他相关信息保存在 Kubernetes 中的 Pod 对象的卷挂载（Volume Mount）配置中。
+
+总结起来，CSI 插件在 Provision 阶段负责创建云盘卷，Attach 阶段负责将卷附加到宿主机，Mount 阶段负责将卷挂载到容器中。
+
+
+
 
 
 ## 31 | 容器存储实践：CSI插件编写指南
+
+在上一篇文章中，我已经为你详细讲解了 CSI 插件机制的设计原理。今天我将继续和你一起实践一个 CSI 插件的编写过程。
+
+为了能够覆盖到 CSI 插件的所有功能，我这一次选择了 DigitalOcean 的块存储（Block Storage）服务，来作为实践对象。
+
+**DigitalOcean 是业界知名的“最简”公有云服务，**即：它只提供虚拟机、存储、网络等为数不多的几个基础功能，其他功能一概不管。而这，恰恰就使得 DigitalOcean 成了我们在公有云上实践 Kubernetes 的最佳选择。
+
+我们这次编写的 CSI 插件的功能，就是：让我们运行在 DigitalOcean 上的 Kubernetes 集群能够使用它的块存储服务，作为容器的持久化存储。
+
+
+
+> 备注：在 DigitalOcean 上部署一个 Kubernetes 集群的过程，也很简单。你只需要先在 DigitalOcean 上创建几个虚拟机，然后按照我们在第 11 篇文章[《从 0 到 1：搭建一个完整的 Kubernetes 集群》](https://time.geekbang.org/column/article/39724)中从 0 到 1 的步骤直接部署即可。
+
+
+
+而有了 CSI 插件之后，持久化存储的用法就非常简单了，你只需要创建一个如下所示的 StorageClass 对象即可：
+
+```
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: do-block-storage
+  namespace: kube-system
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: com.digitalocean.csi.dobs
+
+```
+
+有了这个 StorageClass，External Provisoner 就会为集群中新出现的 PVC 自动创建出 PV，然后调用 CSI 插件创建出这个 PV 对应的 Volume，这正是 CSI 体系中 Dynamic Provisioning 的实现方式。
+
+
+
+> 备注：`storageclass.kubernetes.io/is-default-class: "true"`的意思，是使用这个 StorageClass 作为默认的持久化存储提供者。
+
+
+
+不难看到，这个 StorageClass 里唯一引人注意的，是 provisioner=com.digitalocean.csi.dobs 这个字段。显然，这个字段告诉了 Kubernetes，请使用名叫 com.digitalocean.csi.dobs 的 CSI 插件来为我处理这个 StorageClass 相关的所有操作。
+
+
+
+### **CSI Identity** 
+
+那么，Kubernetes 又是如何知道一个 CSI 插件的名字的呢？
+
+**这就需要从 CSI 插件的第一个服务 CSI Identity 说起了。**
+
+其实，一个 CSI 插件的代码结构非常简单，如下所示：
+
+```
+tree $GOPATH/src/github.com/digitalocean/csi-digitalocean/driver  
+$GOPATH/src/github.com/digitalocean/csi-digitalocean/driver 
+├── controller.go
+├── driver.go
+├── identity.go
+├── mounter.go
+└── node.go
+```
+
+
+其中，CSI Identity 服务的实现，就定义在了 driver 目录下的 identity.go 文件里。
+
+当然，为了能够让 Kubernetes 访问到 CSI Identity 服务，我们需要先在 driver.go 文件里，定义一个标准的 gRPC Server，如下所示：
+
+```
+// Run starts the CSI plugin by communication over the given endpoint
+func (d *Driver) Run() error {
+ ...
+ 
+ listener, err := net.Listen(u.Scheme, addr)
+ ...
+ 
+ d.srv = grpc.NewServer(grpc.UnaryInterceptor(errHandler))
+ csi.RegisterIdentityServer(d.srv, d)
+ csi.RegisterControllerServer(d.srv, d)
+ csi.RegisterNodeServer(d.srv, d)
+ 
+ d.ready = true // we're now ready to go!
+ ...
+ return d.srv.Serve(listener)
+}
+```
+
+可以看到，只要把编写好的 gRPC Server 注册给 CSI，它就可以响应来自 External Components 的 CSI 请求了。
+
+
+
+**CSI Identity 服务中，最重要的接口是 GetPluginInfo**，它返回的就是这个插件的名字和版本号，如下所示：
+
+
+
+> 备注：CSI 各个服务的接口我在上一篇文章中已经介绍过，你也可以在这里找到[它的 protoc 文件](https://github.com/container-storage-interface/spec/blob/master/csi.proto)。
+
+```
+func (d *Driver) GetPluginInfo(ctx context.Context, req *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
+ resp := &csi.GetPluginInfoResponse{
+  Name:          driverName,
+  VendorVersion: version,
+ }
+ ...
+}
+```
+
+其中，driverName 的值，正是"com.digitalocean.csi.dobs"。所以说，Kubernetes 正是通过 GetPluginInfo 的返回值，来找到你在 StorageClass 里声明要使用的 CSI 插件的。
+
+> 备注：CSI 要求插件的名字遵守[“反向 DNS”格式](https://en.wikipedia.org/wiki/Reverse_domain_name_notation)。
+
+
+
+另外一个 **GetPluginCapabilities 接口也很重要**。这个接口返回的是这个 CSI 插件的“能力”。
+
+比如，当你编写的 CSI 插件不准备实现“Provision 阶段”和“Attach 阶段”（比如，一个最简单的 NFS 存储插件就不需要这两个阶段）时，你就可以通过这个接口返回：本插件不提供 CSI Controller 服务，即：没有 csi.PluginCapability_Service_CONTROLLER_SERVICE 这个“能力”。这样，Kubernetes 就知道这个信息了。
+
+最后，**CSI Identity 服务还提供了一个 Probe 接口**。Kubernetes 会调用它来检查这个 CSI 插件是否正常工作。
+
+一般情况下，我建议你在编写插件时给它设置一个 Ready 标志，当插件的 gRPC Server 停止的时候，把这个 Ready 标志设置为 false。或者，你可以在这里访问一下插件的端口，类似于健康检查的做法。
+
+> 备注：关于健康检查的问题，你可以再回顾一下第 15 篇文章[《深入解析 Pod 对象（二）：使用进阶》](https://time.geekbang.org/column/article/40466)中的相关内容。
+
+
+
+### CSI Controller 
+
+然后，我们要开始编写 CSI 插件的第二个服务，即 CSI Controller 服务了。它的代码实现，在 controller.go 文件里。
+
+在上一篇文章中我已经为你讲解过，这个服务主要实现的就是 Volume 管理流程中的“Provision 阶段”和“Attach 阶段”。
+
+**“Provision 阶段”对应的接口，是 CreateVolume 和 DeleteVolume**，它们的调用者是 External Provisoner。以 CreateVolume 为例，它的主要逻辑如下所示：
+
+```
+func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
+ ...
+ 
+ volumeReq := &godo.VolumeCreateRequest{
+  Region:        d.region,
+  Name:          volumeName,
+  Description:   createdByDO,
+  SizeGigaBytes: size / GB,
+ }
+ 
+ ...
+ 
+ vol, _, err := d.doClient.Storage.CreateVolume(ctx, volumeReq)
+ 
+ ...
+ 
+ resp := &csi.CreateVolumeResponse{
+  Volume: &csi.Volume{
+   Id:            vol.ID,
+   CapacityBytes: size,
+   AccessibleTopology: []*csi.Topology{
+    {
+     Segments: map[string]string{
+      "region": d.region,
+     },
+    },
+   },
+  },
+ }
+ 
+ return resp, nil
+}
+
+```
+
+可以看到，对于 DigitalOcean 这样的公有云来说，CreateVolume 需要做的操作，就是调用 DigitalOcean 块存储服务的 API，创建出一个存储卷（d.doClient.Storage.CreateVolume）。如果你使用的是其他类型的块存储（比如 Cinder、Ceph RBD 等），对应的操作也是类似地调用创建存储卷的 API。
+
+
+
+而“**Attach 阶段”对应的接口是 ControllerPublishVolume 和 ControllerUnpublishVolume**，它们的调用者是 External Attacher。以 ControllerPublishVolume 为例，它的逻辑如下所示：
+
+```
+func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
+ ...
+ 
+  dropletID, err := strconv.Atoi(req.NodeId)
+  
+  // check if volume exist before trying to attach it
+  _, resp, err := d.doClient.Storage.GetVolume(ctx, req.VolumeId)
+ 
+ ...
+ 
+  // check if droplet exist before trying to attach the volume to the droplet
+  _, resp, err = d.doClient.Droplets.Get(ctx, dropletID)
+ 
+ ...
+ 
+  action, resp, err := d.doClient.StorageActions.Attach(ctx, req.VolumeId, dropletID)
+
+ ...
+ 
+ if action != nil {
+  ll.Info("waiting until volume is attached")
+ if err := d.waitAction(ctx, req.VolumeId, action.ID); err != nil {
+  return nil, err
+  }
+  }
+  
+  ll.Info("volume is attached")
+ return &csi.ControllerPublishVolumeResponse{}, nil
+}
+
+```
+
+
+
+可以看到，对于 DigitalOcean 来说，ControllerPublishVolume 在“Attach 阶段”需要做的工作，是调用 DigitalOcean 的 API，将我们前面创建的存储卷，挂载到指定的虚拟机上（d.doClient.StorageActions.Attach）。
+
+
+
+其中，存储卷由请求中的 VolumeId 来指定。而虚拟机，也就是将要运行 Pod 的宿主机，则由请求中的 NodeId 来指定。这些参数，都是 External Attacher 在发起请求时需要设置的。
+
+
+
+我在上一篇文章中已经为你介绍过，External Attacher 的工作原理，是监听（Watch）了一种名叫 VolumeAttachment 的 API 对象。这种 API 对象的主要字段如下所示：
+
+```
+// VolumeAttachmentSpec is the specification of a VolumeAttachment request.
+type VolumeAttachmentSpec struct {
+ // Attacher indicates the name of the volume driver that MUST handle this
+ // request. This is the name returned by GetPluginName().
+ Attacher string
+ 
+ // Source represents the volume that should be attached.
+ Source VolumeAttachmentSource
+ 
+ // The node that the volume should be attached to.
+ NodeName string
+}
+
+```
+
+
+
+而这个对象的生命周期，正是由 AttachDetachController 负责管理的（这里，你可以再回顾一下第 28 篇文章[《PV、PVC、StorageClass，这些到底在说啥？》](https://time.geekbang.org/column/article/42698)中的相关内容）。
+
+这个控制循环的职责，是不断检查 Pod 所对应的 PV，在它所绑定的宿主机上的挂载情况，从而决定是否需要对这个 PV 进行 Attach（或者 Dettach）操作。
+
+而这个 Attach 操作，在 CSI 体系里，就是创建出上面这样一个 VolumeAttachment 对象。可以看到，Attach 操作所需的 PV 的名字（Source）、宿主机的名字（NodeName）、存储插件的名字（Attacher），都是这个 VolumeAttachment 对象的一部分。
+
+而当 External Attacher 监听到这样的一个对象出现之后，就可以立即使用 VolumeAttachment 里的这些字段，封装成一个 gRPC 请求调用 CSI Controller 的 ControllerPublishVolume 方法。
+
+最后，我们就可以编写 CSI Node 服务了。
+
+
+
+### 编写 CSI Node 服务
+
+CSI Node 服务对应的，是 Volume 管理流程里的“Mount 阶段”。它的代码实现，在 node.go 文件里。
+
+
+
+我在上一篇文章里曾经提到过，kubelet 的 VolumeManagerReconciler 控制循环会直接调用 CSI Node 服务来完成 Volume 的“Mount 阶段”。
+
+
+
+不过，在具体的实现中，这个“Mount 阶段”的处理其实被细分成了 NodeStageVolume 和 NodePublishVolume 这两个接口。
+
+
+
+这里的原因其实也很容易理解：我在第 28 篇文章[《PV、PVC、StorageClass，这些到底在说啥？》](https://time.geekbang.org/column/article/42698)中曾经介绍过，对于磁盘以及块设备来说，它们被 Attach 到宿主机上之后，就成为了宿主机上的一个待用存储设备。而到了“Mount 阶段”，我们首先需要格式化这个设备，然后才能把它挂载到 Volume 对应的宿主机目录上。
+
+
+
+在 kubelet 的 VolumeManagerReconciler 控制循环中，这两步操作分别叫作 **MountDevice 和 SetUp。**
+
+
+
+其中，MountDevice 操作，就是直接调用了 CSI Node 服务里的 NodeStageVolume 接口。顾名思义，这个接口的作用，就是格式化 Volume 在宿主机上对应的存储设备，然后挂载到一个临时目录（Staging 目录）上。
+
+
+
+对于 DigitalOcean 来说，它对 NodeStageVolume 接口的实现如下所示：
+
+```
+func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+ ...
+ 
+ vol, resp, err := d.doClient.Storage.GetVolume(ctx, req.VolumeId)
+ 
+ ...
+ 
+ source := getDiskSource(vol.Name)
+ target := req.StagingTargetPath
+ 
+ ...
+ 
+ if !formatted {
+  ll.Info("formatting the volume for staging")
+  if err := d.mounter.Format(source, fsType); err != nil {
+   return nil, status.Error(codes.Internal, err.Error())
+  }
+ } else {
+  ll.Info("source device is already formatted")
+ }
+ 
+...
+
+ if !mounted {
+  if err := d.mounter.Mount(source, target, fsType, options...); err != nil {
+   return nil, status.Error(codes.Internal, err.Error())
+  }
+ } else {
+  ll.Info("source device is already mounted to the target path")
+ }
+ 
+ ...
+ return &csi.NodeStageVolumeResponse{}, nil
+}
+
+```
+
+可以看到，在 NodeStageVolume 的实现里，我们首先通过 DigitalOcean 的 API 获取到了这个 Volume 对应的设备路径（getDiskSource）；然后，我们把这个设备格式化成指定的格式（ d.mounter.Format）；最后，我们把格式化后的设备挂载到了一个临时的 Staging 目录（StagingTargetPath）下。
+
+
+
+而 SetUp 操作则会调用 CSI Node 服务的 NodePublishVolume 接口。有了上述对设备的预处理工作后，它的实现就非常简单了，如下所示：
+
+```
+func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+ ...
+ source := req.StagingTargetPath
+ target := req.TargetPath
+ 
+ mnt := req.VolumeCapability.GetMount()
+ options := mnt.MountFlag
+    ...
+    
+ if !mounted {
+  ll.Info("mounting the volume")
+  if err := d.mounter.Mount(source, target, fsType, options...); err != nil {
+   return nil, status.Error(codes.Internal, err.Error())
+  }
+ } else {
+  ll.Info("volume is already mounted")
+ }
+ 
+ return &csi.NodePublishVolumeResponse{}, nil
+}
+
+```
+
+可以看到，在这一步实现中，我们只需要做一步操作，即：将 Staging 目录，绑定挂载到 Volume 对应的宿主机目录上。
+
+
+
+由于 Staging 目录，正是 Volume 对应的设备被格式化后挂载在宿主机上的位置，所以当它和 Volume 的宿主机目录绑定挂载之后，这个 Volume 宿主机目录的“持久化”处理也就完成了。
+
+
+
+当然，我在前面也曾经提到过，对于文件系统类型的存储服务来说，比如 NFS 和 GlusterFS 等，它们并没有一个对应的磁盘“设备”存在于宿主机上，所以 kubelet 在 VolumeManagerReconciler 控制循环中，会跳过 MountDevice 操作而直接执行 SetUp 操作。所以对于它们来说，也就不需要实现 NodeStageVolume 接口了。
+
+
+
+### 部署
+在编写完了 CSI 插件之后，我们就可以把这个插件和 External Components 一起部署起来。
+
+首先，我们需要创建一个 DigitalOcean client 授权需要使用的 Secret 对象，如下所示：
+
+```
+apiVersion: v1
+kind: Secret
+metadata:
+  name: digitalocean
+  namespace: kube-system
+stringData:
+  access-token: "a05dd2f26b9b9ac2asdas__REPLACE_ME____123cb5d1ec17513e06da"
+
+```
+
+接下来，我们通过一句指令就可以将 CSI 插件部署起来：
+
+```bash
+$ kubectl apply -f https://raw.githubusercontent.com/digitalocean/csi-digitalocean/master/deploy/kubernetes/releases/csi-digitalocean-v0.2.0.yaml
+```
+
+这个 CSI 插件的 YAML 文件的主要内容如下所示（其中，非重要的内容已经被略去）：
+
+```
+kind: DaemonSet
+apiVersion: apps/v1beta2
+metadata:
+  name: csi-do-node
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: csi-do-node
+  template:
+    metadata:
+      labels:
+        app: csi-do-node
+        role: csi-do
+    spec:
+      serviceAccount: csi-do-node-sa
+      hostNetwork: true
+      containers:
+        - name: driver-registrar
+          image: quay.io/k8scsi/driver-registrar:v0.3.0
+          ...
+        - name: csi-do-plugin
+          image: digitalocean/do-csi-plugin:v0.2.0
+          args :
+            - "--endpoint=$(CSI_ENDPOINT)"
+            - "--token=$(DIGITALOCEAN_ACCESS_TOKEN)"
+            - "--url=$(DIGITALOCEAN_API_URL)"
+          env:
+            - name: CSI_ENDPOINT
+              value: unix:///csi/csi.sock
+            - name: DIGITALOCEAN_API_URL
+              value: https://api.digitalocean.com/
+            - name: DIGITALOCEAN_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: digitalocean
+                  key: access-token
+          imagePullPolicy: "Always"
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN"]
+            allowPrivilegeEscalation: true
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: pods-mount-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: "Bidirectional"
+            - name: device-dir
+              mountPath: /dev
+      volumes:
+        - name: plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/com.digitalocean.csi.dobs
+            type: DirectoryOrCreate
+        - name: pods-mount-dir
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: device-dir
+          hostPath:
+            path: /dev
+---
+kind: StatefulSet
+apiVersion: apps/v1beta1
+metadata:
+  name: csi-do-controller
+  namespace: kube-system
+spec:
+  serviceName: "csi-do"
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: csi-do-controller
+        role: csi-do
+    spec:
+      serviceAccount: csi-do-controller-sa
+      containers:
+        - name: csi-provisioner
+          image: quay.io/k8scsi/csi-provisioner:v0.3.0
+          ...
+        - name: csi-attacher
+          image: quay.io/k8scsi/csi-attacher:v0.3.0
+          ...
+        - name: csi-do-plugin
+          image: digitalocean/do-csi-plugin:v0.2.0
+          args :
+            - "--endpoint=$(CSI_ENDPOINT)"
+            - "--token=$(DIGITALOCEAN_ACCESS_TOKEN)"
+            - "--url=$(DIGITALOCEAN_API_URL)"
+          env:
+            - name: CSI_ENDPOINT
+              value: unix:///var/lib/csi/sockets/pluginproxy/csi.sock
+            - name: DIGITALOCEAN_API_URL
+              value: https://api.digitalocean.com/
+            - name: DIGITALOCEAN_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: digitalocean
+                  key: access-token
+          imagePullPolicy: "Always"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /var/lib/csi/sockets/pluginproxy/
+      volumes:
+        - name: socket-dir
+          emptyDir: {}
+
+```
+
+可以看到，我们编写的 CSI 插件只有一个二进制文件，它的镜像是 digitalocean/do-csi-plugin:v0.2.0。
+
+
+
+而我们**部署 CSI 插件的常用原则是：**
+
+
+
+**第一，通过 DaemonSet 在每个节点上都启动一个 CSI 插件，来为 kubelet 提供 CSI Node 服务**。这是因为，CSI Node 服务需要被 kubelet 直接调用，所以它要和 kubelet“一对一”地部署起来。
+
+
+
+此外，在上述 DaemonSet 的定义里面，除了 CSI 插件，我们还以 sidecar 的方式运行着 driver-registrar 这个外部组件。它的作用，是向 kubelet 注册这个 CSI 插件。这个注册过程使用的插件信息，则通过访问同一个 Pod 里的 CSI 插件容器的 Identity 服务获取到。
+
+
+
+需要注意的是，由于 CSI 插件运行在一个容器里，那么 CSI Node 服务在“Mount 阶段”执行的挂载操作，实际上是发生在这个容器的 Mount Namespace 里的。可是，我们真正希望执行挂载操作的对象，都是宿主机 /var/lib/kubelet 目录下的文件和目录。
+
+
+
+所以，在定义 DaemonSet Pod 的时候，我们需要把宿主机的 /var/lib/kubelet 以 Volume 的方式挂载进 CSI 插件容器的同名目录下，然后设置这个 Volume 的 mountPropagation=Bidirectional，即开启双向挂载传播，从而将容器在这个目录下进行的挂载操作“传播”给宿主机，反之亦然。
+
+
+
+**第二，通过 StatefulSet 在任意一个节点上再启动一个 CSI 插件，为 External Components 提供 CSI Controller 服务**。所以，作为 CSI Controller 服务的调用者，External Provisioner 和 External Attacher 这两个外部组件，就需要以 sidecar 的方式和这次部署的 CSI 插件定义在同一个 Pod 里。
+
+
+
+你可能会好奇，为什么我们会用 StatefulSet 而不是 Deployment 来运行这个 CSI 插件呢。
+
+这是因为，由于 StatefulSet 需要确保应用拓扑状态的稳定性，所以它对 Pod 的更新，是严格保证顺序的，即：只有在前一个 Pod 停止并删除之后，它才会创建并启动下一个 Pod。
+
+而像我们上面这样将 StatefulSet 的 replicas 设置为 1 的话，StatefulSet 就会确保 Pod 被删除重建的时候，永远有且只有一个 CSI 插件的 Pod 运行在集群中。这对 CSI 插件的正确性来说，至关重要。
+
+而在今天这篇文章一开始，我们就已经定义了这个 CSI 插件对应的 StorageClass（即：do-block-storage），所以你接下来只需要定义一个声明使用这个 StorageClass 的 PVC 即可，如下所示：
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: csi-pvc
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: do-block-storage
+```
+
+当你把上述 PVC 提交给 Kubernetes 之后，你就可以在 Pod 里声明使用这个 csi-pvc 来作为持久化存储了。这一部分使用 PV 和 PVC 的内容，我就不再赘述了。
+
+
+
+### 总结
+
+在今天这篇文章中，我以一个 DigitalOcean 的 CSI 插件为例，和你分享了编写 CSI 插件的具体流程。
+
+
+
+基于这些讲述，你现在应该已经对 Kubernetes 持久化存储体系有了一个更加全面和深入的认识。
+
+
+
+举个例子，对于一个部署了 CSI 存储插件的 Kubernetes 集群来说：
+
+
+
+当用户创建了一个 PVC 之后，你前面部署的 StatefulSet 里的 External Provisioner 容器，就会监听到这个 PVC 的诞生，然后调用同一个 Pod 里的 CSI 插件的 CSI Controller 服务的 CreateVolume 方法，为你创建出对应的 PV。
+
+
+
+这时候，运行在 Kubernetes Master 节点上的 Volume Controller，就会通过 PersistentVolumeController 控制循环，发现这对新创建出来的 PV 和 PVC，并且看到它们声明的是同一个 StorageClass。所以，它会把这一对 PV 和 PVC 绑定起来，使 PVC 进入 Bound 状态。
+
+
+
+然后，用户创建了一个声明使用上述 PVC 的 Pod，并且这个 Pod 被调度器调度到了宿主机 A 上。这时候，Volume Controller 的 AttachDetachController 控制循环就会发现，上述 PVC 对应的 Volume，需要被 Attach 到宿主机 A 上。所以，AttachDetachController 会创建一个 VolumeAttachment 对象，这个对象携带了宿主机 A 和待处理的 Volume 的名字。
+
+这样，StatefulSet 里的 External Attacher 容器，就会监听到这个 VolumeAttachment 对象的诞生。于是，它就会使用这个对象里的宿主机和 Volume 名字，调用同一个 Pod 里的 CSI 插件的 CSI Controller 服务的 ControllerPublishVolume 方法，完成“Attach 阶段”。
+
+
+
+上述过程完成后，运行在宿主机 A 上的 kubelet，就会通过 VolumeManagerReconciler 控制循环，发现当前宿主机上有一个 Volume 对应的存储设备（比如磁盘）已经被 Attach 到了某个设备目录下。于是 kubelet 就会调用同一台宿主机上的 CSI 插件的 CSI Node 服务的 NodeStageVolume 和 NodePublishVolume 方法，完成这个 Volume 的“Mount 阶段”。
+
+
+
+至此，一个完整的持久化 Volume 的创建和挂载流程就结束了。
+
+
+
+### 思考题
+
+请你根据编写 FlexVolume 和 CSI 插件的流程，分析一下什么时候该使用 FlexVolume，什么时候应该使用 CSI？
+
+> chatGPT
+
+在选择使用 FlexVolume 还是 CSI 插件时，可以考虑以下因素：
+
+1. Kubernetes 版本：**FlexVolume 是 Kubernetes 1.2 版本之前引入的插件机制**，而 CSI 是 Kubernetes 1.9 版本之后引入的标准插件接口。如果你使用的是较旧的 Kubernetes 版本，可能只支持 FlexVolume。
+2. 功能和兼容性：CSI 插件提供了更强大和灵活的功能，支持动态卷配置、多节点访问、卷快照等高级功能。而 FlexVolume 插件的功能相对较为有限，不支持动态卷配置和一些高级功能。如果你需要这些高级功能，应该选择 CSI 插件。
+3. 存储供应商支持：CSI 插件是一个标准接口，得到了广泛的存储供应商支持，可以与多种存储后端集成。而 FlexVolume 插件的支持范围相对较窄，可能只有少数存储供应商提供了对应的插件。如果你使用的存储供应商支持 CSI 插件，那么应该选择 CSI 插件以获得更好的兼容性和支持。
+4. 部署和维护成本：CSI 插件相对于 FlexVolume 插件来说，部署和维护的成本可能更高一些，因为 CSI 插件需要与 Kubernetes API Server 进行交互，并且需要在集群中部署 CSI 驱动程序。而 FlexVolume 插件相对来说更简单，只需要将插件二进制文件放置在宿主机上即可。如果你对部署和维护成本有限制，可以考虑使用 FlexVolume 插件。
+
+综上所述，当你使用较新的 Kubernetes 版本、需要更强大的功能和兼容性、存储供应商支持 CSI 插件，并且对部署和维护成本有一定的容忍度时，应该选择 CSI 插件。而在其他情况下，可以考虑使用 FlexVolume 插件。
+
+需要注意的是，随着 Kubernetes 的发展，CSI 插件将成为主流的持久化存储插件接口，而 FlexVolume 插件可能会逐渐被淘汰。因此，在新的项目中，更推荐使用 CSI 插件。
 
 
 
@@ -11516,7 +12541,161 @@ CRI 是 Kubernetes 中定义容器运行时与容器管理器之间交互的接�
 
 ## 47 | 绝不仅仅是安全：Kata Containers 与 gVisor
 
+在上一篇文章中，我为你详细地讲解了 kubelet 和 CRI 的设计和具体的工作原理。而在讲解 CRI 的诞生背景时，我也提到过，这其中的一个重要推动力，就是基于虚拟化或者独立内核的安全容器项目的逐渐成熟。
 
+
+
+使用虚拟化技术来做一个像 Docker 一样的容器项目，并不是一个新鲜的主意。**早在 Docker 项目发布之后，Google 公司就开源了一个实验性的项目，叫作 novm。**这，可以算是试图使用常规的虚拟化技术来运行 Docker 镜像的第一次尝试。不过，novm 在开源后不久，就被放弃了，这对于 Google 公司来说或许不算是什么新鲜事，但是 novm 的昙花一现，还是激发出了很多内核开发者的灵感。
+
+
+
+所以在 2015 年，几乎在同一个星期，Intel OTC （Open Source Technology Center） 和国内的 HyperHQ 团队同时开源了两个基于虚拟化技术的容器实现，分别叫做 Intel Clear Container 和 runV 项目。
+
+而在 2017 年，借着 Kubernetes 的东风，这两个相似的容器运行时项目在中立基金会的撮合下最终合并，就成了现在大家耳熟能详的 **Kata Containers 项目**。 由于 Kata Containers 的本质就是一个精简后的轻量级虚拟机，所以它的特点，就是“像虚拟机一样安全，像容器一样敏捷”。
+
+
+
+而在 2018 年，Google 公司则发布了一个名叫 gVisor 的项目。gVisor 项目给容器进程配置一个用 Go 语言实现的、运行在用户态的、极小的“独立内核”。这个内核对容器进程暴露 Linux 内核 ABI，扮演着“Guest Kernel”的角色，从而达到了将容器和宿主机隔离开的目的。
+
+
+
+不难看到，无论是 Kata Containers，还是 gVisor，它们实现安全容器的方法其实是殊途同归的。**这两种容器实现的本质，都是给进程分配了一个独立的操作系统内核，从而避免了让容器共享宿主机的内核。这样，容器进程能够看到的攻击面，就从整个宿主机内核变成了一个极小的、独立的、以容器为单位的内核，从而有效解决了容器进程发生“逃逸”或者夺取整个宿主机的控制权的问题**。这个原理，可以用如下所示的示意图来表示清楚。
+
+<img src="深入剖析Kubernetes.assets/959c4c40c767acb6a3ffe6e144202e1d.png" alt="img" style="zoom:50%;" />
+
+
+
+而它们的区别在于，Kata Containers 使用的是传统的虚拟化技术，通过虚拟硬件模拟出了一台“小虚拟机”，然后在这个小虚拟机里安装了一个裁剪后的 Linux 内核来实现强隔离。
+
+
+
+而 gVisor 的做法则更加激进，Google 的工程师直接用 Go 语言“模拟”出了一个运行在用户态的操作系统内核，然后通过这个模拟的内核来代替容器进程向宿主机发起有限的、可控的系统调用。
+
+
+
+接下来，我就来为你详细解读一下 KataContainers 和 gVisor 具体的设计原理。
+
+
+
+###  KataContainers
+
+**首先，我们来看 KataContainers**。它的工作原理可以用如下所示的示意图来描述。
+
+<img src="深入剖析Kubernetes.assets/8d7bbc8acaf27adff890f0be637df889.png" alt="img" style="zoom:50%;" />
+
+我们前面说过，Kata Containers 的本质，就是一个轻量化虚拟机。所以当你启动一个 Kata Containers 之后，你其实就会看到一个正常的虚拟机在运行。这也就意味着，一个标准的虚拟机管理程序（Virtual Machine Manager, VMM）是运行 Kata Containers 必备的一个组件。在我们上面图中，使用的 VMM 就是 Qemu。
+
+
+
+而使用了虚拟机作为进程的隔离环境之后，Kata Containers 原生就带有了 Pod 的概念。即：这个 Kata Containers 启动的虚拟机，就是一个 Pod；而用户定义的容器，就是运行在这个轻量级虚拟机里的进程。在具体实现上，Kata Containers 的虚拟机里会有一个特殊的 Init 进程负责管理虚拟机里面的用户容器，并且只为这些容器开启 Mount Namespace。所以，这些用户容器之间，原生就是共享 Network 以及其他 Namespace 的。
+
+
+
+此外，为了跟上层编排框架比如 Kubernetes 进行对接，Kata Containers 项目会启动一系列跟用户容器对应的 shim 进程，来负责操作这些用户容器的生命周期。当然，这些操作，实际上还是要靠虚拟机里的 Init 进程来帮你做到。
+
+
+
+而在具体的架构上，Kata Containers 的实现方式同一个正常的虚拟机其实也非常类似。这里的原理，可以用如下所示的一幅示意图来表示。
+
+<img src="深入剖析Kubernetes.assets/1684d0d89c170c2f8e6d050919c883f3.jpg" alt="img" style="zoom: 33%;" />
+
+可以看到，当 Kata Containers 运行起来之后，虚拟机里的用户进程（容器），实际上只能看到虚拟机里的、被裁减过的 Guest Kernel，以及通过 Hypervisor 虚拟出来的硬件设备。
+
+而为了能够对这个虚拟机的 I/O 性能进行优化，Kata Containers 也会通过 vhost 技术（比如：vhost-user）来实现 Guest 与 Host 之间的高效的网络通信，并且使用 PCI Passthrough （PCI 穿透）技术来让 Guest 里的进程直接访问到宿主机上的物理设备。这些架构设计与实现，其实跟常规虚拟机的优化手段是基本一致的。
+
+
+
+### gVisor 
+
+相比之下，gVisor 的设计其实要更加“激进”一些。它的原理，可以用如下所示的示意图来表示清楚。
+
+![img](深入剖析Kubernetes.assets/2f7903a7c494ddf6989d00c794bd7a7b.png)
+
+gVisor 工作的核心，在于它为应用进程、也就是用户容器，启动了一个名叫 Sentry 的进程。 而 Sentry 进程的主要职责，就是提供一个传统的操作系统内核的能力，即：运行用户程序，执行系统调用。所以说，Sentry 并不是使用 Go 语言重新实现了一个完整的 Linux 内核，而只是一个对应用进程“冒充”内核的系统组件。
+
+
+
+在这种设计思想下，我们就不难理解，Sentry 其实需要自己实现一个完整的 Linux 内核网络栈，以便处理应用进程的通信请求。然后，把封装好的二层帧直接发送给 Kubernetes 设置的 Pod 的 Network Namespace 即可。
+
+
+
+此外，Sentry 对于 Volume 的操作，则需要通过 9p 协议交给一个叫做 Gofer 的代理进程来完成。Gofer 会代替应用进程直接操作宿主机上的文件，并依靠 seccomp 机制将自己的能力限制在最小集，从而防止恶意应用进程通过 Gofer 来从容器中“逃逸”出去。
+
+
+
+而在具体的实现上，gVisor 的 Sentry 进程，其实还分为两种不同的实现方式。这里的工作原理，可以用下面的示意图来描述清楚。
+
+<img src="深入剖析Kubernetes.assets/5a1d6e0291306417864033b3f40f74b8.png" alt="img" style="zoom:50%;" />
+
+**第一种实现方式**，是使用 Ptrace 机制来拦截用户应用的系统调用（System Call），然后把这些系统调用交给 Sentry 来进行处理。
+
+
+
+这个过程，对于应用进程来说，是完全透明的。而 Sentry 接下来，则会扮演操作系统的角色，在用户态执行用户程序，然后仅在需要的时候，才向宿主机发起 Sentry 自己所需要执行的系统调用。这，就是 gVisor 对用户应用进程进行强隔离的主要手段。不过， Ptrace 进行系统调用拦截的性能实在是太差，仅能供 Demo 时使用。
+
+
+
+而**第二种实现方式**，则更加具有普适性。它的工作原理如下图所示。
+
+<img src="深入剖析Kubernetes.assets/3faf90550425378be91eb8cd2f0c63bf.png" alt="img" style="zoom:50%;" />
+
+在这种实现里，Sentry 会使用 KVM 来进行系统调用的拦截，这个性能比 Ptrace 就要好很多了。
+
+
+
+当然，为了能够做到这一点，Sentry 进程就必须扮演一个 Guest Kernel 的角色，负责执行用户程序，发起系统调用。而这些系统调用被 KVM 拦截下来，还是继续交给 Sentry 进行处理。只不过在这时候，Sentry 就切换成了一个普通的宿主机进程的角色，来向宿主机发起它所需要的系统调用。
+
+
+
+可以看到，**在这种实现里，Sentry 并不会真的像虚拟机那样去虚拟出硬件设备、安装 Guest 操作系统。它只是借助 KVM 进行系统调用的拦截，以及处理地址空间切换等细节。**
+
+
+
+值得一提的是，在 Google 内部，他们也是使用的第二种基于 Hypervisor 的 gVisor 实现。只不过 Google 内部有自己研发的 Hypervisor，所以要比 KVM 实现的性能还要好。
+
+
+
+通过以上的讲述，相信你对 Kata Containers 和 gVisor 的实现原理，已经有一个感性的认识了。需要指出的是，到目前为止，gVisor 的实现依然不是非常完善，有很多 Linux 系统调用它还不支持；有很多应用，在 gVisor 里还没办法运行起来。 此外，gVisor 也暂时没有实现一个 Pod 多个容器的支持。当然，在后面的发展中，这些工程问题一定会逐渐解决掉的。
+
+
+
+另外，你可能还听说过 AWS 在 2018 年末发布的一个叫做 Firecracker 的安全容器项目。这个项目的核心，其实是一个用 Rust 语言重新编写的 VMM（即：虚拟机管理器）。这就意味着， Firecracker 和 Kata Containers 的本质原理，其实是一样的。只不过， Kata Containers 默认使用的 VMM 是 Qemu，而 Firecracker，则使用自己编写的 VMM。所以，理论上，Kata Containers 也可以使用 Firecracker 运行起来。
+
+### 总结
+
+在本篇文章中，我为你详细地介绍了拥有独立内核的安全容器项目，对比了 KataContainers 和 gVisor 的设计与实现细节。
+
+
+
+在性能上，KataContainers 和 KVM 实现的 gVisor 基本不分伯仲，在启动速度和占用资源上，基于用户态内核的 gVisor 还略胜一筹。但是，对于系统调用密集的应用，比如重 I/O 或者重网络的应用，gVisor 就会因为需要频繁拦截系统调用而出现性能急剧下降的情况。此外，gVisor 由于要自己使用 Sentry 去模拟一个 Linux 内核，所以它能支持的系统调用是有限的，只是 Linux 系统调用的一个子集。
+
+
+
+不过，gVisor 虽然现在没有任何优势，但是这种通过在用户态运行一个操作系统内核，来为应用进程提供强隔离的思路，的确是未来安全容器进一步演化的一个非常有前途的方向。
+
+值得一提的是，Kata Containers 团队在 gVisor 之前，就已经 Demo 了一个名叫 Linuxd 的项目。这个项目，使用了 User Mode Linux (UML) 技术，在用户态运行起了一个真正的 Linux Kernel 来为应用进程提供强隔离，从而避免了重新实现 Linux Kernel 带来的各种麻烦。
+
+
+
+有兴趣的话，你可以[在这里查看](https://lc32018.sched.com/event/ER8x/run-linux-kernel-as-a-daemon-lai-jiangshan-hypersh)这个演讲。我相信，这个方向，应该才是安全容器进化的未来。这比 Unikernels 这种根本不适合实际场景中使用的思路，要靠谱得多。
+
+> 本篇图片出处均引自[ Kata Containers 的官方对比资料](https://www.openstack.org/assets/presentation-media/kata-containers-and-gvisor-a-quantitave-comparison.pdf)。
+
+
+
+### 思考题
+
+安全容器的意义，绝不仅仅止于安全。你可以想象一下这样一个场景：比如，你的宿主机的 Linux 内核版本是 3.6，但是应用却必须要求 Linux 内核版本是 4.0。这时候，你就可以把这个应用运行在一个 KataContainers 里。那么请问，你觉得使用 gVisor 是否也能提供这种能力呢？原因是什么呢？
+
+> chatGPT
+
+使用 gVisor 可以提供类似的能力，即在不同内核版本的宿主机上运行应用程序。gVisor 是一个用户态容器运行时，它通过在应用程序和宿主机内核之间引入一个沙箱层来提供隔离和安全性。
+
+gVisor 的工作原理是将应用程序的系统调用转发到 gVisor 内部的用户态实现，而不是直接与宿主机内核交互。这样，即使宿主机的内核版本较低，gVisor 仍然可以提供与较新内核版本相似的系统调用接口和功能。因此，即使应用程序要求较高版本的内核，也可以在较低版本的内核上运行。
+
+与 KataContainers 不同的是，gVisor 不是一个完整的虚拟化解决方案，而是一个轻量级的容器运行时。它通过在用户态实现沙箱层来提供隔离，而不需要创建完整的虚拟机。这使得 gVisor 的启动和运行开销较低，适用于更多的场景。
+
+因此，使用 gVisor 可以提供类似的能力，即在不同内核版本的宿主机上运行应用程序。gVisor 的用户态实现可以提供与较新内核版本相似的系统调用接口和功能，从而满足应用程序对较高内核版本的要求。
 
 
 
